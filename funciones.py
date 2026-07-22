@@ -295,10 +295,15 @@ def evaluar_forward(
         )
 
         if forzar_reentrenamiento and os.path.exists(ruta_cache):
+            print(f"[evaluar_forward] Cache existente en '{ruta_cache}': se reescribira (forzar_reentrenamiento=True).")
             os.remove(ruta_cache)
 
-        if not forzar_reentrenamiento and os.path.exists(ruta_cache):
+        elif not forzar_reentrenamiento and os.path.exists(ruta_cache):
+            print(f"[evaluar_forward] Cache existente en '{ruta_cache}': se cargan los resultados guardados.")
             return pd.read_pickle(ruta_cache)
+
+        else:
+            print(f"[evaluar_forward] Sin cache previo en '{ruta_cache}': se entrena desde cero.")
 
     resultados = []
     total_variables = X.shape[1]
@@ -362,17 +367,18 @@ def graficar_matrices_confusion(
     y_test,
     y_pred_test,
     display_labels=("No potable", "Potable"),
-    normalize="true",
     figsize=(10, 4.5)
 ):
     """
     Grafica las matrices de confusion de train y test lado a lado en una
-    sola figura, con estilo formal (colorbar compartida, titulos y
-    etiquetas consistentes) apto para un paper.
+    sola figura, con estilo formal (titulos y etiquetas consistentes)
+    apto para un paper.
 
-    Ambas matrices se normalizan y se colorean sobre la misma escala
-    [0, 1], de forma que el color sea comparable entre train y test
-    (en vez de depender del conteo absoluto de cada conjunto).
+    Cada matriz se colorea por conteo (no por porcentaje) y con su
+    propia escala de color independiente (cada una con su colorbar), de
+    forma que dentro de cada matriz se distinga claramente que cuadrante
+    concentra mas poblacion, sin forzar a train y test a compartir
+    escala.
 
     Parameters
     ----------
@@ -387,10 +393,6 @@ def graficar_matrices_confusion(
     display_labels : tuple of str, optional
         Nombres de las clases, en el orden correspondiente a las
         etiquetas. Por defecto ("No potable", "Potable").
-    normalize : {"true", "pred", "all"} or None, optional
-        Eje sobre el que se normaliza la matriz, ver
-        `sklearn.metrics.confusion_matrix`. Por defecto "true"
-        (porcentaje sobre cada clase real, es decir, cada fila suma 1).
     figsize : tuple of int, optional
         Tamano de la figura en pulgadas (ancho, alto). Por defecto
         (10, 4.5).
@@ -408,28 +410,22 @@ def graficar_matrices_confusion(
         y_train,
         y_pred_train,
         display_labels=display_labels,
-        normalize=normalize,
-        values_format=".1%",
         cmap="Blues",
         ax=axes[0],
-        colorbar=False,
+        colorbar=True,
         text_kw={"fontsize": 11}
     )
-    disp_train.im_.set_clim(0, 1)
     axes[0].set_title("Train", fontsize=12, fontweight="bold")
 
     disp_test = ConfusionMatrixDisplay.from_predictions(
         y_test,
         y_pred_test,
         display_labels=display_labels,
-        normalize=normalize,
-        values_format=".1%",
         cmap="Blues",
         ax=axes[1],
-        colorbar=False,
+        colorbar=True,
         text_kw={"fontsize": 11}
     )
-    disp_test.im_.set_clim(0, 1)
     axes[1].set_title("Test", fontsize=12, fontweight="bold")
 
     for ax in axes:
@@ -437,10 +433,7 @@ def graficar_matrices_confusion(
         ax.set_ylabel("Real", fontsize=10)
         ax.grid(False)
 
-    fig.suptitle("Matrices de confusion (normalizadas)", fontsize=14, fontweight="bold")
-
-    cbar = fig.colorbar(disp_test.im_, ax=list(axes), shrink=0.85)
-    cbar.set_label("Proporcion sobre la clase real", fontsize=10)
+    fig.suptitle("Matrices de confusion", fontsize=14, fontweight="bold")
 
     return fig, axes
 
@@ -529,3 +522,111 @@ def comparar_metricas_train_test(metrics_train, metrics_test):
         "brecha_overfit": "{:.3f}",
         "brecha_relativa_pct": "{:.2f}%"
     })
+
+
+def guardar_datasets_excel(
+    df,
+    X_train,
+    X_test,
+    y_train,
+    y_test,
+    scaler,
+    features,
+    objetivo,
+    ruta_excel,
+    columnas_imputables=("ph", "Sulfate", "Trihalomethanes")
+):
+    """
+    Guarda en un unico archivo Excel tres versiones del dataset
+    (originales, imputados, normalizados), cada una en su propia hoja,
+    con train y test unificados (X + Y) y columnas de control para
+    distinguir particion e imputacion.
+
+    "originales" se reconstruye indexando `df` (datos crudos, con
+    nulos) por los indices de `X_train`/`X_test`. "imputados" se
+    recupera invirtiendo `scaler` sobre `X_train`/`X_test` (recupera el
+    estado post-imputacion/pre-escalado). "normalizados" es el estado
+    actual (ya imputado y escalado) de `X_train`/`X_test`.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Dataset original completo (con nulos), tal como se leyo antes
+        de cualquier imputacion o split.
+    X_train : pandas.DataFrame
+        Variables predictoras de entrenamiento, en su estado actual
+        (imputado y escalado).
+    X_test : pandas.DataFrame
+        Variables predictoras de prueba, en su estado actual (imputado
+        y escalado).
+    y_train : pandas.Series
+        Variable objetivo de entrenamiento.
+    y_test : pandas.Series
+        Variable objetivo de prueba.
+    scaler : sklearn transformer
+        Escalador (por ejemplo `StandardScaler`) ya ajustado sobre
+        `X_train`, usado para invertir el escalado y recuperar la
+        version "imputados".
+    features : list of str
+        Nombres de las columnas originales (crudas) a usar para la hoja
+        "originales".
+    objetivo : str
+        Nombre de la columna objetivo, agregada a cada tabla.
+    ruta_excel : str
+        Ruta del archivo `.xlsx` de salida. La carpeta contenedora se
+        crea si no existe.
+    columnas_imputables : tuple of str, optional
+        Columnas sobre las que se aplico imputacion, usadas para
+        calcular "_Imputation_" y "_ImputationCol_". Por defecto
+        ("ph", "Sulfate", "Trihalomethanes").
+
+    Returns
+    -------
+    str
+        La ruta del archivo Excel generado.
+    """
+    def agregar_indicadores(X_part, y_part, part_ind):
+        tabla = X_part.copy()
+        tabla[objetivo] = y_part.values
+        tabla["_PartInd_"] = part_ind
+
+        nulos = df.loc[X_part.index, list(columnas_imputables)].isna()
+        tabla["_Imputation_"] = nulos.any(axis=1).astype(int)
+        tabla["_ImputationCol_"] = nulos.apply(
+            lambda fila: ",".join(fila.index[fila]), axis=1
+        )
+        return tabla
+
+    # Originales: valores crudos (con nulos), tal cual antes de imputar
+    tabla_originales = pd.concat([
+        agregar_indicadores(df.loc[X_train.index, features], y_train, 0),
+        agregar_indicadores(df.loc[X_test.index, features], y_test, 1),
+    ], ignore_index=True)
+
+    # Imputados: se recupera invirtiendo el escalado ya ajustado
+    X_train_imputado = pd.DataFrame(
+        scaler.inverse_transform(X_train), columns=X_train.columns, index=X_train.index
+    )
+    X_test_imputado = pd.DataFrame(
+        scaler.inverse_transform(X_test), columns=X_test.columns, index=X_test.index
+    )
+
+    tabla_imputados = pd.concat([
+        agregar_indicadores(X_train_imputado, y_train, 0),
+        agregar_indicadores(X_test_imputado, y_test, 1),
+    ], ignore_index=True)
+
+    # Normalizados: estado actual (ya imputado y escalado)
+    tabla_normalizados = pd.concat([
+        agregar_indicadores(X_train, y_train, 0),
+        agregar_indicadores(X_test, y_test, 1),
+    ], ignore_index=True)
+
+    os.makedirs(os.path.dirname(ruta_excel), exist_ok=True)
+
+    with pd.ExcelWriter(ruta_excel, engine="openpyxl") as writer:
+        tabla_originales.to_excel(writer, sheet_name="originales", index=False)
+        tabla_imputados.to_excel(writer, sheet_name="imputados", index=False)
+        tabla_normalizados.to_excel(writer, sheet_name="normalizados", index=False)
+
+    return ruta_excel
