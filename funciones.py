@@ -1,7 +1,19 @@
+import hashlib
+import os
+
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.feature_selection import SequentialFeatureSelector
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score
+)
 from sklearn.model_selection import cross_validate
 from tqdm.auto import tqdm
 
@@ -12,8 +24,10 @@ def graficar_box_hist_grid(df, features, variables_por_fila=2, num_bins=10):
     organizados en una cuadricula de N variables por fila.
 
     Cada variable ocupa dos subplots contiguos (boxplot e histograma).
-    El histograma incluye una barra adicional "Vacios" con el conteo de
-    valores nulos de la variable.
+    El eje Y del histograma esta en porcentaje (no en conteos), calculado
+    sobre el total de registros de la variable (incluyendo los vacios),
+    e incluye una barra adicional "Vacios" con el porcentaje de valores
+    nulos, de forma que ambas partes sumen 100%.
 
     Parameters
     ----------
@@ -59,6 +73,8 @@ def graficar_box_hist_grid(df, features, variables_por_fila=2, num_bins=10):
         serie = df[feature]
         datos_validos = serie.dropna()
         cantidad_vacios = serie.isna().sum()
+        total_registros = len(serie)
+        porcentaje_vacios = cantidad_vacios / total_registros * 100
 
         ax_box = axes[f"box_{idx}"]
         ax_hist = axes[f"hist_{idx}"]
@@ -76,10 +92,15 @@ def graficar_box_hist_grid(df, features, variables_por_fila=2, num_bins=10):
         ax_box.set_xlabel(feature)
         ax_box.set_yticks([])
 
-        # Histograma
+        # Histograma (eje Y en porcentaje sobre el total de registros,
+        # incluyendo los vacios, para que sumado con la barra "Vacios"
+        # de 100%)
+        pesos = np.full(len(datos_validos), 100 / total_registros)
+
         frecuencias, limites, _ = ax_hist.hist(
             datos_validos,
             bins=num_bins,
+            weights=pesos,
             edgecolor="black",
             alpha=0.75
         )
@@ -90,7 +111,7 @@ def graficar_box_hist_grid(df, features, variables_por_fila=2, num_bins=10):
 
         ax_hist.bar(
             posicion_vacios,
-            cantidad_vacios,
+            porcentaje_vacios,
             width=ancho_bin,
             color="gray",
             edgecolor="black"
@@ -99,8 +120,8 @@ def graficar_box_hist_grid(df, features, variables_por_fila=2, num_bins=10):
         # Etiqueta sobre la barra de vacios
         ax_hist.text(
             posicion_vacios,
-            cantidad_vacios,
-            str(cantidad_vacios),
+            porcentaje_vacios,
+            f"{porcentaje_vacios:.1f}%",
             ha="center",
             va="bottom"
         )
@@ -127,7 +148,7 @@ def graficar_box_hist_grid(df, features, variables_por_fila=2, num_bins=10):
         )
 
         ax_hist.set_xlabel(feature)
-        ax_hist.set_ylabel("Frecuencia")
+        ax_hist.set_ylabel("Porcentaje (%)")
 
     return fig, axes
 
@@ -197,7 +218,15 @@ def graficar_metricas_forward(resultados_forward, figsize=(10, 6)):
 
     return fig, ax
 
-def evaluar_forward(X, y, modelo, cv):
+def evaluar_forward(
+    X,
+    y,
+    modelo,
+    cv,
+    permitir_persistencia=True,
+    forzar_reentrenamiento=False,
+    directorio_cache="cache"
+):
     """
     Evalua un modelo mediante forward selection incremental, calculando
     F1, AUC y Recall promedio por validacion cruzada para cada cantidad
@@ -208,6 +237,12 @@ def evaluar_forward(X, y, modelo, cv):
     evalua el modelo resultante con `cross_validate` sobre esas variables.
     Cuando k es igual al total de variables, se usan todas sin ejecutar
     el selector.
+
+    Al ser un proceso costoso, el resultado se puede memorizar en disco:
+    se arma una "line" (huella) con las columnas de X, su forma, el
+    estimador (con sus hiperparametros) y el esquema de validacion
+    cruzada, y se hashea (md5) para nombrar el archivo de cache. Si ya
+    existe un resultado con ese hash, se reutiliza en vez de reentrenar.
 
     Parameters
     ----------
@@ -221,6 +256,17 @@ def evaluar_forward(X, y, modelo, cv):
     cv : int, cross-validation generator or iterable
         Estrategia de validacion cruzada usada tanto en el selector como
         en `cross_validate`.
+    permitir_persistencia : bool, optional
+        Si es True (por defecto), el resultado se guarda en
+        `directorio_cache` y, si ya existe un resultado para la misma
+        combinacion de X, modelo y cv, se reutiliza en lugar de
+        recalcularlo.
+    forzar_reentrenamiento : bool, optional
+        Si es True, se borra el hash existente (si lo hay) y se vuelve a
+        entrenar desde cero, sobrescribiendo el cache. Por defecto False.
+    directorio_cache : str, optional
+        Carpeta donde se guardan/leen los resultados persistidos. Por
+        defecto "cache".
 
     Returns
     -------
@@ -229,6 +275,30 @@ def evaluar_forward(X, y, modelo, cv):
         "numero_variables", "f1_cv", "auc_cv", "recall_cv" (promedios de
         validacion cruzada) y "variables" (lista de variables usadas).
     """
+    ruta_cache = None
+
+    if permitir_persistencia:
+        line = "|".join([
+            str(sorted(X.columns.tolist())),
+            str(X.shape),
+            str(getattr(y, "name", "y")),
+            repr(modelo.get_params()),
+            repr(cv)
+        ])
+
+        hash_line = hashlib.md5(line.encode("utf-8")).hexdigest()
+
+        os.makedirs(directorio_cache, exist_ok=True)
+        ruta_cache = os.path.join(
+            directorio_cache,
+            f"evaluar_forward_{hash_line}.pkl"
+        )
+
+        if forzar_reentrenamiento and os.path.exists(ruta_cache):
+            os.remove(ruta_cache)
+
+        if not forzar_reentrenamiento and os.path.exists(ruta_cache):
+            return pd.read_pickle(ruta_cache)
 
     resultados = []
     total_variables = X.shape[1]
@@ -278,4 +348,184 @@ def evaluar_forward(X, y, modelo, cv):
             "variables": variables
         })
 
-    return pd.DataFrame(resultados)
+    resultado_df = pd.DataFrame(resultados)
+
+    if permitir_persistencia:
+        resultado_df.to_pickle(ruta_cache)
+
+    return resultado_df
+
+
+def graficar_matrices_confusion(
+    y_train,
+    y_pred_train,
+    y_test,
+    y_pred_test,
+    display_labels=("No potable", "Potable"),
+    normalize="true",
+    figsize=(10, 4.5)
+):
+    """
+    Grafica las matrices de confusion de train y test lado a lado en una
+    sola figura, con estilo formal (colorbar compartida, titulos y
+    etiquetas consistentes) apto para un paper.
+
+    Ambas matrices se normalizan y se colorean sobre la misma escala
+    [0, 1], de forma que el color sea comparable entre train y test
+    (en vez de depender del conteo absoluto de cada conjunto).
+
+    Parameters
+    ----------
+    y_train : array-like
+        Etiquetas reales del conjunto de entrenamiento.
+    y_pred_train : array-like
+        Etiquetas predichas para el conjunto de entrenamiento.
+    y_test : array-like
+        Etiquetas reales del conjunto de prueba.
+    y_pred_test : array-like
+        Etiquetas predichas para el conjunto de prueba.
+    display_labels : tuple of str, optional
+        Nombres de las clases, en el orden correspondiente a las
+        etiquetas. Por defecto ("No potable", "Potable").
+    normalize : {"true", "pred", "all"} or None, optional
+        Eje sobre el que se normaliza la matriz, ver
+        `sklearn.metrics.confusion_matrix`. Por defecto "true"
+        (porcentaje sobre cada clase real, es decir, cada fila suma 1).
+    figsize : tuple of int, optional
+        Tamano de la figura en pulgadas (ancho, alto). Por defecto
+        (10, 4.5).
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Figura generada.
+    axes : numpy.ndarray of matplotlib.axes.Axes
+        Los dos ejes (train, test) retornados por `plt.subplots`.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
+
+    disp_train = ConfusionMatrixDisplay.from_predictions(
+        y_train,
+        y_pred_train,
+        display_labels=display_labels,
+        normalize=normalize,
+        values_format=".1%",
+        cmap="Blues",
+        ax=axes[0],
+        colorbar=False,
+        text_kw={"fontsize": 11}
+    )
+    disp_train.im_.set_clim(0, 1)
+    axes[0].set_title("Train", fontsize=12, fontweight="bold")
+
+    disp_test = ConfusionMatrixDisplay.from_predictions(
+        y_test,
+        y_pred_test,
+        display_labels=display_labels,
+        normalize=normalize,
+        values_format=".1%",
+        cmap="Blues",
+        ax=axes[1],
+        colorbar=False,
+        text_kw={"fontsize": 11}
+    )
+    disp_test.im_.set_clim(0, 1)
+    axes[1].set_title("Test", fontsize=12, fontweight="bold")
+
+    for ax in axes:
+        ax.set_xlabel("Prediccion", fontsize=10)
+        ax.set_ylabel("Real", fontsize=10)
+        ax.grid(False)
+
+    fig.suptitle("Matrices de confusion (normalizadas)", fontsize=14, fontweight="bold")
+
+    cbar = fig.colorbar(disp_test.im_, ax=list(axes), shrink=0.85)
+    cbar.set_label("Proporcion sobre la clase real", fontsize=10)
+
+    return fig, axes
+
+
+def classification_metrics(y_true, y_pred, scores=None):
+    """
+    Calcula un conjunto estandar de metricas de clasificacion binaria.
+
+    Parameters
+    ----------
+    y_true : array-like
+        Etiquetas reales.
+    y_pred : array-like
+        Etiquetas predichas por el modelo.
+    scores : array-like, optional
+        Puntajes o probabilidades usados para calcular el AUC (por
+        ejemplo, la salida de `decision_function` o `predict_proba`).
+        Si es None, "roc_auc" se retorna como NaN.
+
+    Returns
+    -------
+    dict
+        Diccionario con las claves "accuracy", "precision", "recall",
+        "f1" y "roc_auc".
+    """
+    result = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+    }
+    result["roc_auc"] = (
+        roc_auc_score(y_true, scores) if scores is not None else np.nan
+    )
+    return result
+
+
+def comparar_metricas_train_test(metrics_train, metrics_test):
+    """
+    Construye una tabla comparativa de metricas de train vs test,
+    incluyendo la brecha absoluta y relativa (indicador de overfitting),
+    lista para mostrarse en el notebook.
+
+    Parameters
+    ----------
+    metrics_train : dict
+        Metricas del conjunto de entrenamiento, tal como las retorna
+        `classification_metrics`.
+    metrics_test : dict
+        Metricas del conjunto de prueba, tal como las retorna
+        `classification_metrics`.
+
+    Returns
+    -------
+    pandas.io.formats.style.Styler
+        Tabla con columnas "train", "test", "brecha_overfit" (train -
+        test) y "brecha_relativa_pct" (brecha_overfit / train, en
+        porcentaje), formateada para su despliegue directo.
+    """
+    metrics_comparison = pd.DataFrame({
+        "train": metrics_train,
+        "test": metrics_test
+    })
+
+    # Diferencia absoluta
+    metrics_comparison["brecha_overfit"] = (
+        metrics_comparison["train"]
+        - metrics_comparison["test"]
+    )
+
+    # Diferencia relativa respecto a train
+    metrics_comparison["brecha_relativa_pct"] = np.where(
+        metrics_comparison["train"] != 0,
+        (
+            metrics_comparison["brecha_overfit"]
+            / metrics_comparison["train"]
+        ) * 100,
+        np.nan
+    )
+
+    metrics_comparison.index.name = "metrica"
+
+    return metrics_comparison.style.format({
+        "train": "{:.3f}",
+        "test": "{:.3f}",
+        "brecha_overfit": "{:.3f}",
+        "brecha_relativa_pct": "{:.2f}%"
+    })

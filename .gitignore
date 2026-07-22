@@ -18,6 +18,9 @@ __pycache__/
 # Jupyter
 .ipynb_checkpoints/
 
+# Cache de resultados persistidos (evaluar_forward, etc.)
+cache/
+
 # OS files
 .DS_Store
 Thumbs.db
