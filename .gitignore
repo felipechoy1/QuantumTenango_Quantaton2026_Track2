@@ -21,9 +21,6 @@ __pycache__/
 # Cache de resultados persistidos (evaluar_forward, etc.)
 cache/
 
-# Datasets generados (originales/imputados/normalizados, etc.)
-data/processed/
-
 # OS files
 .DS_Store
 Thumbs.db
