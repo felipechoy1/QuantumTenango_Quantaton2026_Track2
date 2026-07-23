@@ -1406,3 +1406,704 @@ def guardar_matriz_kernel_run(
     output_path = output_dir / f"kernel_matrix_run_{safe_run_id}.csv"
     run_df.to_csv(output_path, index=False, sep=";")
     return output_path
+
+
+def cargar_datos_kernel(ruta="data/processed/df_escalado.csv"):
+    """
+    Carga el dataset escalado del kernel y lo separa en train/test segun
+    la columna ``_PartInd_`` (0 = train, 1 = test).
+
+    Parameters
+    ----------
+    ruta : str, optional
+        Ruta del CSV escalado (separador ";"). Por defecto
+        "data/processed/df_escalado.csv".
+
+    Returns
+    -------
+    tuple
+        (kernel_df, feature_columns, train_df, test_df): el dataset
+        completo, la lista de columnas de features (excluye Potability y
+        _PartInd_) y las particiones train/test solo con features.
+    """
+    kernel_df = pd.read_csv(ruta, sep=";")
+    feature_columns = [
+        column
+        for column in kernel_df.columns
+        if column not in {"Potability", "_PartInd_"}
+    ]
+
+    train_df = (
+        kernel_df.loc[kernel_df["_PartInd_"] == 0, feature_columns]
+        .reset_index(drop=True)
+    )
+    test_df = (
+        kernel_df.loc[kernel_df["_PartInd_"] == 1, feature_columns]
+        .reset_index(drop=True)
+    )
+    return kernel_df, feature_columns, train_df, test_df
+
+
+def seleccionar_par_kernel(train_df, row_i, row_j):
+    """
+    Valida los indices de un par, construye su circuito de inspeccion
+    (con barreras, para visualizarlo) e imprime sus dimensiones.
+
+    Parameters
+    ----------
+    train_df : pandas.DataFrame
+        Particion de train con solo features.
+    row_i, row_j : int
+        Indices de las filas a comparar.
+
+    Returns
+    -------
+    tuple
+        (x_i, x_j, preview_circuit): los vectores de features y el
+        circuito pytket del kernel con barreras.
+
+    Raises
+    ------
+    IndexError
+        Si algun indice es negativo o queda fuera de train.
+    """
+    if min(row_i, row_j) < 0:
+        raise IndexError("Los indices no pueden ser negativos.")
+    if max(row_i, row_j) >= len(train_df):
+        raise IndexError("row_i o row_j queda fuera de train.")
+
+    x_i = train_df.iloc[row_i].to_numpy(dtype=float)
+    x_j = train_df.iloc[row_j].to_numpy(dtype=float)
+    preview_circuit = kernel_circuit_zz(x_i, x_j, remove_barriers=False)
+
+    print(f"Kernel seleccionado: train[{row_i}] vs train[{row_j}]")
+    print("Qubits:", preview_circuit.n_qubits)
+    print("Puertas:", preview_circuit.n_gates)
+    print("Profundidad:", preview_circuit.depth())
+    return x_i, x_j, preview_circuit
+
+
+def ejecutar_par_kernel(
+    x_i,
+    x_j,
+    run_kernel,
+    execution_target,
+    row_i,
+    row_j,
+    n_shots=1000,
+    seed=42,
+    guardar=True,
+    project_name=None,
+):
+    """
+    Ejecuta el kernel de un par segun el interruptor y el destino.
+
+    - ``run_kernel=False``: no ejecuta nada (interruptor de seguridad).
+    - ``execution_target="local"``: corre el par en Selene local y
+      devuelve el resumen (opcionalmente guardado en CSV).
+    - ``execution_target="nexus_selene"``: compila el programa guppy,
+      lo sube y envia el job remoto; el resultado se recoge despues con
+      `consultar_par_kernel`.
+
+    Parameters
+    ----------
+    x_i, x_j : array-like
+        Vectores de features del par.
+    run_kernel : bool
+        Interruptor de seguridad; en False solo imprime el aviso.
+    execution_target : str
+        "local" o "nexus_selene".
+    row_i, row_j : int
+        Indices de las filas comparadas (para nombres y registro).
+    n_shots : int, optional
+        Shots por ejecucion. Por defecto 1000.
+    seed : int, optional
+        Semilla local. Por defecto 42.
+    guardar : bool, optional
+        Si True (default), guarda el resumen local en CSV.
+    project_name : str, optional
+        Proyecto de Nexus (requerido para el destino remoto).
+
+    Returns
+    -------
+    tuple
+        (job_ref, summary): la referencia del job remoto (o None) y el
+        resumen local (o None).
+
+    Raises
+    ------
+    ValueError
+        Si el destino no es valido o falta project_name en remoto.
+    """
+    if not run_kernel:
+        print("Ejecucion desactivada.")
+        print(
+            "Revisa el circuito y luego cambia RUN_KERNEL = True "
+            f"para ejecutar train[{row_i}] vs train[{row_j}]."
+        )
+        return None, None
+
+    if execution_target == "local":
+        pair = ejecutar_kernel_guppy(x_i, x_j, n_shots=n_shots, seed=seed)
+        print(f"Simulacion local finalizada. K({row_i},{row_j}) = {pair['kernel']:.4f}")
+        if guardar:
+            ruta = guardar_resumen_kernel_csv(
+                summary=pair["summary"], row_i=row_i, row_j=row_j,
+                source="local_statevector",
+            )
+            print("Resumen del kernel guardado en:", ruta)
+        return None, pair["summary"]
+
+    if execution_target == "nexus_selene":
+        if project_name is None:
+            raise ValueError("Se requiere project_name para el destino remoto.")
+        conectar_nexus(project_name)
+        suffix = uuid.uuid4().hex[:8]
+
+        pair_program, pair_circuit = crear_programa_kernel_guppy(x_i, x_j)
+        _, ref_hugr = compilar_y_subir_hugr(
+            pair_program, f"zz-kernel-{row_i}-{row_j}-{suffix}"
+        )
+        job_ref = enviar_job_selene(
+            ref_hugr,
+            n_qubits=pair_circuit.n_qubits,
+            n_shots=n_shots,
+            nombre=f"zz-kernel-selene-{row_i}-{row_j}-{suffix}",
+        )
+        submit_status = qnx.jobs.status(job_ref)
+
+        print("Job enviado a Selene/Nexus.")
+        print("Job ID:", job_ref.id)
+        print("Estado inicial:", submit_status.status)
+        print("Usa la celda de consulta para obtener el resultado.")
+        return job_ref, None
+
+    raise ValueError('EXECUTION_TARGET debe ser "local" o "nexus_selene"')
+
+
+def consultar_par_kernel(job_ref, n_qubits, row_i, row_j, guardar=True):
+    """
+    Consulta el job remoto de un par del kernel sin bloquear; cuando
+    termina, extrae el resumen (y opcionalmente lo guarda en CSV).
+
+    Parameters
+    ----------
+    job_ref
+        Referencia del job remoto enviado por `ejecutar_par_kernel`, o
+        None si no se envio ninguno.
+    n_qubits : int
+        Numero de qubits del circuito del par.
+    row_i, row_j : int
+        Indices de las filas comparadas.
+    guardar : bool, optional
+        Si True (default), guarda el resumen en CSV al terminar.
+
+    Returns
+    -------
+    dict or None
+        El resumen del kernel si el job ya esta COMPLETED; None si aun
+        no hay job o sigue en curso.
+
+    Raises
+    ------
+    RuntimeError
+        Si el job termino con error o fue cancelado.
+    """
+    if job_ref is None:
+        print("No hay un job remoto nuevo que consultar.")
+        return None
+
+    status = qnx.jobs.status(job_ref)
+    print("Estado:", status.status)
+    print("Mensaje:", status.message)
+
+    if "COMPLETED" in str(status.status):
+        _, downloaded, _, _ = descargar_resultados_job(job_ref)
+        summary = resumen_kernel_desde_resultado(downloaded[0], n_qubits)
+        if guardar:
+            ruta = guardar_resumen_kernel_csv(
+                summary=summary, row_i=row_i, row_j=row_j,
+                source="nexus_selene_statevector",
+                job_id=job_ref.id,
+                job_name=getattr(job_ref.annotations, "name", None),
+            )
+            print("Resumen del kernel guardado en:", ruta)
+        return summary
+
+    if "ERROR" in str(status.status) or "CANCELLED" in str(status.status):
+        raise RuntimeError(f"El job termino sin exito: {status}")
+
+    print("El job sigue en cola o ejecucion. Consulta nuevamente mas tarde.")
+    return None
+
+
+MATRIX_BACKEND_OPTIONS = [
+    "local_selene_statevector",
+    "nexus_selene_statevector",
+    "H1-1LE",
+    "H1-Emulator",
+    "H2-1LE",
+    "H2-Emulator",
+    "Helios-1E-lite",
+]
+
+
+def preparar_backend_matriz(backend, n_qubits):
+    """
+    Valida el backend de la matriz y construye su configuracion.
+
+    Parameters
+    ----------
+    backend : str
+        Uno de `MATRIX_BACKEND_OPTIONS`.
+    n_qubits : int
+        Numero de qubits de los circuitos (features del dataset).
+
+    Returns
+    -------
+    dict
+        Con claves: execution_target ("local" o "nexus"), nexus_target,
+        program_format ("hugr" o "pytket_circuit") y backend_config.
+        Para el backend local, todo salvo execution_target es None.
+
+    Raises
+    ------
+    ValueError
+        Si el backend no esta en `MATRIX_BACKEND_OPTIONS`.
+    """
+    if backend not in MATRIX_BACKEND_OPTIONS:
+        raise ValueError(
+            f"Backend desconocido: {backend}. Opciones: {MATRIX_BACKEND_OPTIONS}"
+        )
+
+    if backend == "local_selene_statevector":
+        return {
+            "execution_target": "local",
+            "nexus_target": None,
+            "program_format": None,
+            "backend_config": None,
+        }
+
+    nexus_target = (
+        "selene_statevector" if backend == "nexus_selene_statevector" else backend
+    )
+
+    if nexus_target == "selene_statevector":
+        program_format = "hugr"
+        backend_config = qnx.models.SeleneConfig(
+            n_qubits=n_qubits,
+            simulator=qnx.models.StatevectorSimulator(),
+        )
+    elif nexus_target.startswith("Helios-"):
+        program_format = "hugr"
+        backend_config = qnx.models.HeliosConfig(system_name=nexus_target)
+    else:
+        # H1/H2 no aceptan HUGR directo. Se usa el Circuit de pytket.
+        program_format = "pytket_circuit"
+        backend_config = qnx.models.QuantinuumConfig(device_name=nexus_target)
+
+    return {
+        "execution_target": "nexus",
+        "nexus_target": nexus_target,
+        "program_format": program_format,
+        "backend_config": backend_config,
+    }
+
+
+def enviar_matriz_kernel_nexus(
+    matrix_input,
+    rows,
+    backend_info,
+    backend,
+    n_shots,
+    seed,
+    ejecutar_diagonal,
+):
+    """
+    Sube un programa por par del triangulo de la matriz y envia el job a
+    Nexus: execute job directo para formato HUGR (Selene/Helios) o
+    compile job para circuitos pytket (H1/H2, que no aceptan HUGR; el
+    execute se encadena despues en `consultar_matriz_nexus`).
+
+    Parameters
+    ----------
+    matrix_input : pandas.DataFrame
+        Filas de train seleccionadas (solo features).
+    rows : list of int
+        Indices originales de las filas.
+    backend_info : dict
+        Resultado de `preparar_backend_matriz`.
+    backend : str
+        Nombre del backend (para el registro).
+    n_shots : int
+        Shots por circuito.
+    seed : int
+        Semilla base (solo registro; los backends remotos no la usan).
+    ejecutar_diagonal : bool
+        Si True, incluye los pares (i, i).
+
+    Returns
+    -------
+    dict
+        Estado de la matriz remota: backend, nexus_target,
+        program_format, backend_config, n_shots, rows, n_qubits,
+        ejecutar_diagonal, pair_metadata, job_ref y compile_job_ref.
+    """
+    matrix_values = matrix_input.to_numpy(dtype=float)
+    n_rows = len(rows)
+    program_format = backend_info["program_format"]
+    nexus_target = backend_info["nexus_target"]
+    suffix = uuid.uuid4().hex[:8]
+
+    pair_metadata = []
+    hugr_refs = []
+    circuit_refs = []
+    planned = (
+        n_rows * (n_rows + 1) // 2 if ejecutar_diagonal
+        else n_rows * (n_rows - 1) // 2
+    )
+
+    with tqdm(
+        total=planned,
+        desc=f"Preparando {program_format}",
+        unit="circuito",
+    ) as progress:
+        for i in range(n_rows):
+            start_j = i if ejecutar_diagonal else i + 1
+
+            for j in range(start_j, n_rows):
+                pair_name = f"zz-matrix-{rows[i]}-{rows[j]}-{suffix}"
+                metadata = {
+                    "matrix_i": i,
+                    "matrix_j": j,
+                    "row_i": rows[i],
+                    "row_j": rows[j],
+                    "seed": seed + i * n_rows + j,
+                }
+
+                if program_format == "hugr":
+                    pair_program, _ = crear_programa_kernel_guppy(
+                        matrix_values[i],
+                        matrix_values[j],
+                    )
+                    _, pair_ref = compilar_y_subir_hugr(pair_program, pair_name)
+                    hugr_refs.append(pair_ref)
+                else:
+                    pair_circuit = kernel_circuit_zz(
+                        matrix_values[i],
+                        matrix_values[j],
+                        remove_barriers=True,
+                    )
+                    pair_circuit.measure_all()
+                    pair_ref = qnx.circuits.upload(
+                        circuit=pair_circuit,
+                        name=pair_name,
+                    )
+                    circuit_refs.append(pair_ref)
+
+                pair_metadata.append(metadata)
+                progress.update(1)
+
+    estado = {
+        "backend": backend,
+        "nexus_target": nexus_target,
+        "program_format": program_format,
+        "backend_config": backend_info["backend_config"],
+        "n_shots": n_shots,
+        "rows": list(rows),
+        "n_qubits": matrix_input.shape[1],
+        "ejecutar_diagonal": ejecutar_diagonal,
+        "pair_metadata": pair_metadata,
+        "job_ref": None,
+        "compile_job_ref": None,
+    }
+
+    if program_format == "hugr":
+        estado["job_ref"] = qnx.start_execute_job(
+            programs=hugr_refs,
+            n_shots=[n_shots] * len(hugr_refs),
+            backend_config=estado["backend_config"],
+            name=f"zz-kernel-matrix-{nexus_target}-{suffix}",
+        )
+        print("Job de ejecucion HUGR enviado.")
+        print("Execute Job ID:", estado["job_ref"].id)
+    else:
+        estado["compile_job_ref"] = qnx.start_compile_job(
+            programs=circuit_refs,
+            backend_config=estado["backend_config"],
+            optimisation_level=2,
+            skip_intermediate_circuits=True,
+            name=f"compile-zz-matrix-{nexus_target}-{suffix}",
+        )
+        print("Circuitos pytket subidos; compile job enviado.")
+        print("Compile Job ID:", estado["compile_job_ref"].id)
+
+    print("Backend:", backend)
+    print("Formato:", program_format)
+    print("Programas:", len(pair_metadata))
+    print("Consulta el avance con la celda de consulta; no reenvies esta celda.")
+    return estado
+
+
+def iniciar_matriz_kernel(
+    train_df,
+    rows,
+    backend,
+    run_matrix,
+    n_shots=1000,
+    seed=42,
+    ejecutar_diagonal=False,
+    guardar=True,
+    project_name=None,
+):
+    """
+    Punto de entrada de la seccion de matriz kernel: valida la seleccion
+    y despacha segun el interruptor y el backend.
+
+    - ``run_matrix=False``: solo imprime el plan (filas, backend y
+      cuantos circuitos se ejecutarian) sin consumir shots.
+    - Backend local: construye la matriz en Selene local y devuelve el
+      resultado (opcionalmente guardado en CSV).
+    - Backend de Nexus: sube los programas, envia el job y devuelve el
+      estado para seguirlo con `consultar_matriz_nexus`.
+
+    Parameters
+    ----------
+    train_df : pandas.DataFrame
+        Particion de train con solo features.
+    rows : list of int
+        Indices de las filas que forman la matriz.
+    backend : str
+        Uno de `MATRIX_BACKEND_OPTIONS`.
+    run_matrix : bool
+        Interruptor de seguridad; en False solo imprime el plan.
+    n_shots : int, optional
+        Shots por circuito. Por defecto 1000.
+    seed : int, optional
+        Semilla base local. Por defecto 42.
+    ejecutar_diagonal : bool, optional
+        Si True, ejecuta tambien los pares (i, i); si False, fija la
+        diagonal en 1. Por defecto False.
+    guardar : bool, optional
+        Si True (default), guarda el run local en CSV.
+    project_name : str, optional
+        Proyecto de Nexus (requerido para backends remotos).
+
+    Returns
+    -------
+    tuple
+        (estado, matrix_result): el estado remoto (o None) y el
+        resultado local (o None).
+
+    Raises
+    ------
+    ValueError
+        Si rows es invalido, el backend no existe o falta project_name
+        en un backend remoto.
+    IndexError
+        Si algun indice de rows queda fuera de train.
+    """
+    if not rows:
+        raise ValueError("MATRIX_ROWS no puede estar vacio.")
+    if min(rows) < 0 or max(rows) >= len(train_df):
+        raise IndexError("Algun indice de MATRIX_ROWS queda fuera de train.")
+    if len(set(rows)) != len(rows):
+        raise ValueError("MATRIX_ROWS no debe contener indices repetidos.")
+
+    matrix_input = train_df.iloc[rows]
+    n_rows = len(rows)
+    planned = (
+        n_rows * (n_rows + 1) // 2 if ejecutar_diagonal
+        else n_rows * (n_rows - 1) // 2
+    )
+
+    backend_info = preparar_backend_matriz(backend, matrix_input.shape[1])
+
+    if not run_matrix:
+        print("Construccion de matriz desactivada.")
+        print("Filas seleccionadas:", rows)
+        print("Backend seleccionado:", backend)
+        print("Opciones:", MATRIX_BACKEND_OPTIONS)
+        print("Circuitos que se ejecutarian:", planned)
+        print("Cambia RUN_MATRIX = True cuando quieras iniciar.")
+        return None, None
+
+    if backend_info["execution_target"] == "local":
+        matrix_result = construir_matriz_kernel_guppy(
+            X=matrix_input,
+            row_labels=rows,
+            n_shots=n_shots,
+            seed=seed,
+            simulator="statevector",
+            ejecutar_diagonal=ejecutar_diagonal,
+        )
+        if guardar:
+            ruta = guardar_matriz_kernel_run(
+                matrix_result, source="local_statevector"
+            )
+            print("Run de matriz guardado en:", ruta)
+        return None, matrix_result
+
+    if project_name is None:
+        raise ValueError("Se requiere project_name para backends de Nexus.")
+    conectar_nexus(project_name)
+    estado = enviar_matriz_kernel_nexus(
+        matrix_input,
+        rows,
+        backend_info,
+        backend,
+        n_shots=n_shots,
+        seed=seed,
+        ejecutar_diagonal=ejecutar_diagonal,
+    )
+    return estado, None
+
+
+def consultar_matriz_nexus(estado, guardar=True):
+    """
+    Consulta el avance de una matriz kernel remota sin bloquear el
+    cuaderno. Reejecutar esta consulta es seguro; nunca reenvia los
+    programas.
+
+    Para H1/H2 primero refresca el compile job y, cuando termina,
+    encadena automaticamente el execute job con los circuitos
+    compilados. Despues consulta el execute job y, al aparecer
+    COMPLETED, descarga los resultados y reconstruye la matriz.
+
+    Parameters
+    ----------
+    estado : dict or None
+        Estado devuelto por `iniciar_matriz_kernel` (None si no se
+        envio una matriz remota).
+    guardar : bool, optional
+        Si True (default), guarda el run en CSV al completarse.
+
+    Returns
+    -------
+    tuple
+        (estado, matrix_result): el estado actualizado (con el execute
+        job encadenado si aplico) y el resultado reconstruido, o None si
+        el job sigue en curso.
+
+    Raises
+    ------
+    RuntimeError
+        Si el compile o el execute job terminan sin exito, o si la
+        cantidad de circuitos/resultados no coincide con los pares.
+    """
+    terminal_errors = {"ERROR", "CANCELLED", "TERMINATED", "DEPLETED"}
+
+    if estado is None:
+        print("No hay una matriz remota nueva que consultar.")
+        return estado, None
+
+    if estado["compile_job_ref"] is not None and estado["job_ref"] is None:
+        compile_status = qnx.jobs.status(estado["compile_job_ref"])
+        print("Compile status:", compile_status.status)
+        print("Compile message:", compile_status.message)
+
+        if compile_status.status == qnx.jobs.JobStatusEnum.COMPLETED:
+            fresh_compile_ref = qnx.jobs.get(id=estado["compile_job_ref"].id)
+            compile_results = list(qnx.jobs.results(fresh_compile_ref))
+            compiled_refs = [item.get_output() for item in compile_results]
+
+            if len(compiled_refs) != len(estado["pair_metadata"]):
+                raise RuntimeError(
+                    "La cantidad de circuitos compilados no coincide con los pares."
+                )
+
+            estado["job_ref"] = qnx.start_execute_job(
+                programs=compiled_refs,
+                n_shots=[estado["n_shots"]] * len(compiled_refs),
+                backend_config=estado["backend_config"],
+                name=(
+                    f"execute-zz-matrix-{estado['nexus_target']}-"
+                    f"{uuid.uuid4().hex[:8]}"
+                ),
+            )
+            print("Compilacion terminada; execute job enviado.")
+            print("Execute Job ID:", estado["job_ref"].id)
+        elif compile_status.status.value in terminal_errors:
+            raise RuntimeError(f"El compile job termino sin exito: {compile_status}")
+        else:
+            print("La compilacion continua. Reejecuta esta celda mas tarde.")
+
+    if estado["job_ref"] is None:
+        if estado["compile_job_ref"] is not None:
+            print("Aun no existe execute job; espera a que termine la compilacion.")
+        return estado, None
+
+    matrix_status = qnx.jobs.status(estado["job_ref"])
+    print("Execute status:", matrix_status.status)
+    print("Execute message:", matrix_status.message)
+
+    queue_position = getattr(matrix_status, "queue_position", None)
+    if queue_position is not None:
+        print("Posicion en cola:", queue_position)
+
+    if matrix_status.status != qnx.jobs.JobStatusEnum.COMPLETED:
+        if matrix_status.status.value in terminal_errors:
+            raise RuntimeError(f"El execute job termino sin exito: {matrix_status}")
+        print("La ejecucion continua. Reejecuta esta celda mas tarde.")
+        return estado, None
+
+    _, matrix_downloaded, _, matrix_result_ids = descargar_resultados_job(
+        estado["job_ref"]
+    )
+    if len(matrix_downloaded) != len(estado["pair_metadata"]):
+        raise RuntimeError(
+            "La cantidad de resultados no coincide con los pares enviados."
+        )
+
+    n_rows = len(estado["rows"])
+    remote_matrix = np.eye(n_rows, dtype=float)
+    if estado["ejecutar_diagonal"]:
+        remote_matrix.fill(0.0)
+    remote_run_rows = []
+
+    for metadata, downloaded_result, result_id in zip(
+        estado["pair_metadata"],
+        matrix_downloaded,
+        matrix_result_ids,
+    ):
+        summary = resumen_kernel_desde_resultado(
+            downloaded_result,
+            estado["n_qubits"],
+        )
+        i = metadata["matrix_i"]
+        j = metadata["matrix_j"]
+        remote_matrix[i, j] = summary["kernel_rate"]
+        remote_matrix[j, i] = summary["kernel_rate"]
+
+        remote_run_rows.append({
+            **metadata,
+            "result_id": result_id,
+            "backend": estado["backend"],
+            "program_format": estado["program_format"],
+            "n_qubits": estado["n_qubits"],
+            "zero_state": summary["zero_state"],
+            "zero_count": summary["zero_count"],
+            "shots": summary["shots"],
+            "kernel_rate": summary["kernel_rate"],
+        })
+
+    matrix_result = {
+        "kernel_matrix": remote_matrix,
+        "run_summary": pd.DataFrame(remote_run_rows),
+        "row_labels": estado["rows"],
+        "n_circuits": len(estado["pair_metadata"]),
+        "n_shots_per_circuit": estado["n_shots"],
+    }
+
+    print("Matriz kernel reconstruida.")
+    if guardar:
+        ruta = guardar_matriz_kernel_run(
+            matrix_result,
+            source=f"nexus_{estado['backend']}",
+            run_id=str(estado["job_ref"].id),
+            job_id=estado["job_ref"].id,
+            job_name=getattr(estado["job_ref"].annotations, "name", None),
+        )
+        print("Run de matriz guardado en:", ruta)
+
+    return estado, matrix_result
