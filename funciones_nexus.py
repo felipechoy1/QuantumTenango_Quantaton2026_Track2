@@ -1095,7 +1095,8 @@ def guardar_resumen_kernel_csv(
     Returns
     -------
     pathlib.Path
-        Ruta del CSV generado (``kernel_run_<run_id>.csv``).
+        Ruta del CSV generado (``kernel_run_<run_id>.csv``), con
+        separador ";" como el resto de los CSV del proyecto.
     """
     if run_id is None:
         run_id = str(job_id) if job_id is not None else f"local-{uuid.uuid4().hex[:12]}"
@@ -1118,7 +1119,7 @@ def guardar_resumen_kernel_csv(
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_run_id = str(run_id).replace("/", "_").replace("\\", "_")
     output_path = output_dir / f"kernel_run_{safe_run_id}.csv"
-    pd.DataFrame([row]).to_csv(output_path, index=False)
+    pd.DataFrame([row]).to_csv(output_path, index=False, sep=";")
     return output_path
 
 
@@ -1344,10 +1345,21 @@ def guardar_matriz_kernel_run(
     source="local_statevector",
     run_id=None,
     job_id=None,
+    job_name=None,
+    directory="data/runs",
 ):
     """
     Guarda en CSV el resumen compacto de una construccion de matriz
     kernel (una fila por circuito ejecutado).
+
+    El CSV usa siempre el mismo esquema de columnas, sin importar si la
+    matriz se construyo en el simulador local o se reconstruyo desde un
+    job remoto: el bloque de identificacion (run_id, source, job_id,
+    job_name) seguido de las columnas del par y su resultado. Las
+    columnas que no aplican a un origen (por ejemplo `seed` en remoto, o
+    `result_id`/`backend`/`program_format` en local) quedan vacias, de
+    modo que todos los archivos coinciden en formato desde el origen.
+    Separador ";" como el resto de los CSV del proyecto.
 
     Parameters
     ----------
@@ -1361,6 +1373,10 @@ def guardar_matriz_kernel_run(
         local nuevo (``matrix-local-<uuid>``).
     job_id : optional
         Identificador del job de Nexus, si aplica.
+    job_name : str, optional
+        Nombre del job de Nexus, si aplica.
+    directory : str, optional
+        Carpeta destino. Por defecto "data/runs".
 
     Returns
     -------
@@ -1371,13 +1387,22 @@ def guardar_matriz_kernel_run(
         run_id = f"matrix-local-{uuid.uuid4().hex[:12]}"
 
     run_df = matrix_result["run_summary"].copy()
+    run_df.insert(0, "job_name", "" if job_name is None else str(job_name))
     run_df.insert(0, "job_id", "" if job_id is None else str(job_id))
     run_df.insert(0, "source", source)
     run_df.insert(0, "run_id", str(run_id))
 
-    output_dir = Path("data/runs")
+    columnas = [
+        "run_id", "source", "job_id", "job_name",
+        "matrix_i", "matrix_j", "row_i", "row_j", "result_id",
+        "backend", "program_format", "n_qubits", "zero_state",
+        "zero_count", "shots", "kernel_rate", "seed",
+    ]
+    run_df = run_df.reindex(columns=columnas, fill_value="")
+
+    output_dir = Path(directory)
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_run_id = str(run_id).replace("/", "_").replace("\\", "_")
     output_path = output_dir / f"kernel_matrix_run_{safe_run_id}.csv"
-    run_df.to_csv(output_path, index=False)
+    run_df.to_csv(output_path, index=False, sep=";")
     return output_path
