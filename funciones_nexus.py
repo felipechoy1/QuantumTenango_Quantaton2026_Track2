@@ -1765,10 +1765,15 @@ def cargar_datos_kernel_muestreo(
         raise ValueError("nivel_test debe ser 1, 2 o 3.")
 
     kernel_df = pd.read_excel(ruta_excel, sheet_name=sheet_name)
+    # Se excluyen tambien las marcas de imputacion por si la hoja las trae:
+    # son indicadores del pipeline, no features del kernel.
     feature_columns = [
         column
         for column in kernel_df.columns
-        if column not in {objetivo, particion, columna_muestreo}
+        if column not in {
+            objetivo, particion, columna_muestreo,
+            "_Imputation_", "_ImputationCol_",
+        }
     ]
 
     train_df = (

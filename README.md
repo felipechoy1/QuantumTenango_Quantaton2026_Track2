@@ -10,7 +10,9 @@ Entorno de trabajo para el notebook `Código_Hackaton_v1.ipynb` (QSVM con Qiskit
 ## Datos generados
 
 - `data/raw/`: dataset original (`water_potability.csv`).
-- `data/processed/`: datasets exportados por `guardar_datasets_excel` (celda final del notebook). Genera un único `.xlsx` con tres hojas (`originales`, `imputados`, `normalizados`), cada una con train y test unificados y columnas de control `_PartInd_` (0=train, 1=test), `_Imputation_` (1 si la fila tuvo algún valor imputado) e `_ImputationCol_` (nombre de las columnas imputadas, separadas por coma si es más de una).
+- `data/processed/dataset_v1.xlsx`: generado por `guardar_datasets_excel` (`funciones.py`) con tres hojas (`originales`, `imputados`, `normalizados`), cada una con train y test unificados y columnas de control `_PartInd_` (0=train, 1=test), `_Imputation_` (1 si la fila tuvo algún valor imputado) e `_ImputationCol_` (nombre de las columnas imputadas, separadas por coma si es más de una). El notebook agrega después dos hojas más al mismo archivo (`guardar_muestreo_excel`, celda de guardado de `variables`):
+  - `muestreos`: submuestra jerárquica balanceada y anidada (`asignar_muestreo_balanceado`), marcada por la columna `_Muestreo_` (nivel más profundo alcanzado; la muestra de nivel k son las filas con `_Muestreo_ >= k`). Solo incluye filas **sin imputación** (`_Imputation_ == 0`): al trabajar con pocas filas se prioriza usar datos vírgenes.
+  - `variables`: lista de variables (columna `_vars_`) seleccionadas por forward selection (`n_vars`), fuente de verdad de las features que consume el kernel cuántico.
 - `cache/`: resultados persistidos de `evaluar_forward` (no se sube al repositorio, ver `.gitignore`; se regenera automáticamente al correr el notebook).
 
 ## Entorno Conda
@@ -63,6 +65,17 @@ Este archivo es un `venv` (entorno virtual de Python) comprimido, no un entorno 
 - 2026-07-22: `evaluar_forward` incorpora persistencia por hash (cache en disco) para evitar reentrenar si ya existe un resultado para la misma combinación de datos, modelo e hiperparámetros; imprime en consola si entrenó desde cero, cargó del cache, o reescribió el cache existente.
 - 2026-07-22: `graficar_matrices_confusion` colorea por conteo (no por porcentaje), con una barra de color independiente por cada matriz (train, test) para ver la proporcionalidad de cuadrantes dentro de cada una.
 - 2026-07-23: el cache de `evaluar_forward` pasa de pickle a JSON. Al instalar `guppylang`/`qnexus`/`pytket` en `qsvm`, `pandas` bajó de 3.0.3 a 2.3.3 como dependencia transitiva, y los `.pkl` guardados con la version anterior dejaron de poder leerse (`NotImplementedError` al deserializar `StringDtype`). JSON no depende de la representacion binaria interna de pandas/numpy, asi que es inmune a este tipo de incompatibilidad entre versiones. Se borraron los `.pkl` viejos de `cache/` (se regeneran solos al reentrenar).
+- 2026-07-23: `asignar_muestreo_balanceado` agrega la regla de datos vírgenes: el muestreo jerárquico solo usa filas sin imputación (`_Imputation_ == 0`, parámetro `columna_imputacion`). Se regeneró la hoja `muestreos` del Excel bajo esta regla.
+- 2026-07-23: nueva hoja `variables` en `dataset_v1.xlsx` con las columnas seleccionadas por forward selection (`n_vars`); `guppy_kernel_qsvm.ipynb` la usa como fuente de verdad para filtrar las features del kernel (valida nombres, duplicados y ajusta `N_QUBITS` automáticamente al número de variables).
+
+## Kernel cuántico (`guppy_kernel_qsvm.ipynb`)
+
+Construye el kernel de fidelidad cuántico `K(x_i, x_j) = P(00...0)` del circuito `U(x_j)^dagger U(x_i)` para alimentar un QSVM (`SVC(kernel="precomputed")`). Vive en `funciones_nexus.py`; debe abrirse siempre con el kernel del entorno Conda `quantum_space`.
+
+- **Feature maps** (parámetro `FEATURE_MAP`, mismo para K_train y K_test): `"zz"` (ZZFeatureMap: H + Rz + CX-Rz-CX), `"zyy"` (Pauli Z+YY explícito, sin `PauliExpBox`) y `"ry_cx_rx"` (Ry → cadena CX → Rx). Registrados en `FEATURE_MAPS`; `kernel_circuit(x_i, x_j, feature_map=...)` es el constructor genérico.
+- **Datos**: `cargar_datos_kernel_muestreo` lee la hoja `muestreos` de `dataset_v1.xlsx` y filtra train/test por nivel de muestreo (`TRAIN_MUESTREO`/`TEST_MUESTREO`, independientes; notación `"3"`/`"3+2"`/`"3+2+1"` vía `NIVELES_MUESTREO`). Después el notebook cruza con la hoja `variables` para quedarse solo con las features seleccionadas.
+- **K_train y K_test**: celdas separadas con estado independiente (`matrix_state_train`/`matrix_state_test`), para que ambos jobs de Nexus puedan coexistir sin pisarse. `iniciar_matriz_kernel_test` arma K_test apilando `[test, train]`, reusa la maquinaria de matriz cuadrada y recorta el bloque test×train.
+- **Guardado**: `guardar_kernel_qsvm` persiste la matriz de Gram con los valores crudos (sin redondear) en `data/runs/kernel_qsvm_<run_id>.csv` (K_train, cuadrada) o `kernel_qsvm_test_<run_id>.csv` (K_test, rectangular), más un CSV de metadatos con la procedencia.
 
 ## Nota: consulta de ejecuciones en Quantinuum Nexus
 

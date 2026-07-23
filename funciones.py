@@ -673,6 +673,7 @@ def asignar_muestreo_balanceado(
     objetivo="Potability",
     particion="_PartInd_",
     columna="_Muestreo_",
+    columna_imputacion="_Imputation_",
     random_state=42,
 ):
     """
@@ -691,10 +692,17 @@ def asignar_muestreo_balanceado(
     reconstruir cada muestra: las filas de la muestra de nivel k son las que
     tienen `columna` >= k (por el anidamiento).
 
+    Regla de datos virgenes: el muestreo se hace unicamente sobre filas
+    **sin imputacion** (`columna_imputacion` == 0). Al trabajar con pocas
+    filas conviene centrarse en datos que no fueron tocados por la
+    imputacion. Basta filtrar el pool del nivel 1: los niveles siguientes
+    son submuestras de el, asi que heredan la regla.
+
     Parameters
     ----------
     df : pandas.DataFrame
-        Datos con las columnas `objetivo` y `particion`.
+        Datos con las columnas `objetivo`, `particion` y
+        `columna_imputacion`.
     tamanos_por_particion : dict
         Mapea cada valor de `particion` a una lista de tamanos totales de
         muestra, de mayor a menor y anidados (por ejemplo
@@ -707,6 +715,10 @@ def asignar_muestreo_balanceado(
         Columna que define las particiones. Por defecto "_PartInd_".
     columna : str, optional
         Nombre de la columna de muestreo a crear. Por defecto "_Muestreo_".
+    columna_imputacion : str or None, optional
+        Columna que marca filas con algun valor imputado (1) o virgenes
+        (0). Por defecto "_Imputation_". Con None se desactiva la regla y
+        se muestrea sobre toda la particion.
     random_state : int, optional
         Semilla para reproducibilidad. Por defecto 42.
 
@@ -719,17 +731,29 @@ def asignar_muestreo_balanceado(
     Raises
     ------
     ValueError
-        Si algun tamano no es divisible entre el numero de clases, los
-        tamanos no van en orden estrictamente decreciente, o no hay
-        suficientes filas de alguna clase para una muestra balanceada.
+        Si falta `columna_imputacion` en `df`, algun tamano no es divisible
+        entre el numero de clases, los tamanos no van en orden
+        estrictamente decreciente, o no hay suficientes filas de alguna
+        clase para una muestra balanceada.
     """
     resultado = df.copy()
     resultado[columna] = 0
     rng = np.random.RandomState(random_state)
 
+    if columna_imputacion is not None and columna_imputacion not in resultado.columns:
+        raise ValueError(
+            f"La columna '{columna_imputacion}' no existe en df; se necesita para "
+            f"muestrear solo filas sin imputacion (o pasa columna_imputacion=None "
+            f"para desactivar la regla)."
+        )
+
     for valor_particion, tamanos in tamanos_por_particion.items():
         tamanos = list(tamanos)
         filas_particion = resultado.loc[resultado[particion] == valor_particion]
+        if columna_imputacion is not None:
+            filas_particion = filas_particion.loc[
+                filas_particion[columna_imputacion] == 0
+            ]
         clases = sorted(filas_particion[objetivo].unique())
         n_clases = len(clases)
 
