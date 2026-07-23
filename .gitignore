@@ -21,6 +21,11 @@ __pycache__/
 # Cache de resultados persistidos (evaluar_forward, etc.)
 cache/
 
+# Entrega original del kernel ZZ: ya homologada en funciones_nexus.py y
+# guppy_kernel_qsvm.ipynb. Se conserva local como referencia, sin
+# seguimiento; el baseline congelado vive en el historial (commit cbb2caf).
+guppy_kernel_handoff/
+
 # OS files
 .DS_Store
 Thumbs.db
