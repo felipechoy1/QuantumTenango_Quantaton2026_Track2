@@ -26,7 +26,7 @@ from guppylang.std.builtins import array, comptime, result
 from guppylang.std.quantum import measure_array, qubit
 from pytket import Circuit
 from pytket.passes import RemoveBarriers
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 
 def conectar_nexus(project_name):
