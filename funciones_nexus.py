@@ -1192,9 +1192,8 @@ def resumen_kernel_desde_resultado(execution_result, n_qubits):
     -------
     dict
         Con claves: zero_state, zero_count, shots, kernel_rate
-        (``zero_count / shots``, redondeado a 6 decimales; los valores
-        del kernel suelen ser pequenos y esa precision es la que se
-        conserva al guardar y mostrar).
+        (``zero_count / shots``, sin redondear: se conserva el valor
+        crudo tal como sale del backend).
 
     Raises
     ------
@@ -1233,7 +1232,7 @@ def resumen_kernel_desde_resultado(execution_result, n_qubits):
             "Guppy con register_counts() o BackendResult con get_counts()."
         )
 
-    kernel_rate = round(zero_count / shots, 6) if shots else 0.0
+    kernel_rate = zero_count / shots if shots else 0.0
     return {
         "zero_state": zero_state,
         "zero_count": zero_count,
@@ -1530,8 +1529,6 @@ def guardar_matriz_kernel_run(
         "zero_count", "shots", "kernel_rate", "seed",
     ]
     run_df = run_df.reindex(columns=columnas, fill_value="")
-    if "kernel_rate" in run_df.columns:
-        run_df["kernel_rate"] = pd.to_numeric(run_df["kernel_rate"], errors="coerce").round(6)
 
     output_dir = Path(directory)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1561,9 +1558,7 @@ def guardar_kernel_qsvm(
 
     - ``kernel_qsvm_<run_id>.csv``: la matriz K, con filas y columnas
       etiquetadas por los indices de las observaciones (`row_labels`).
-      Se guarda redondeada a 6 decimales (los valores del kernel suelen
-      ser pequenos; con esa precision se distinguen sin ruido de punto
-      flotante).
+      Se guarda con los valores crudos, sin redondear.
     - ``kernel_qsvm_<run_id>_meta.csv``: una fila con la procedencia
       (source/backend, job_id, shots, numero de filas, qubits, etc.).
 
@@ -1634,7 +1629,7 @@ def guardar_kernel_qsvm(
     # K_test lleva el infijo _test_ para no pisar la matriz de train.
     infijo = "test_" if es_rectangular else ""
     ruta_matriz = output_dir / f"kernel_qsvm_{infijo}{safe_run_id}.csv"
-    pd.DataFrame(np.round(K, 6), index=labels, columns=col_labels).to_csv(ruta_matriz, sep=";")
+    pd.DataFrame(K, index=labels, columns=col_labels).to_csv(ruta_matriz, sep=";")
 
     ruta_meta = output_dir / f"kernel_qsvm_{infijo}{safe_run_id}_meta.csv"
     pd.DataFrame([meta]).to_csv(ruta_meta, index=False, sep=";")
