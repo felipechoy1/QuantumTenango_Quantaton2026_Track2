@@ -160,6 +160,14 @@ def descargar_resultados_job(job_ref):
     y ese atributo no se refresca solo), lo que provocaba un falso
     "job no COMPLETED" aunque en Nexus el job ya hubiera terminado.
 
+    Antes de pedir los resultados tambien se refresca la referencia
+    completa con `qnx.jobs.get(id=...)`, para no reutilizar metadatos
+    cacheados del submit.
+
+    Los conteos se extraen con `collated_counts()` (resultados de
+    Selene/guppy) o, si el resultado no lo ofrece, con `get_counts()`
+    (BackendResult de pytket, que es lo que devuelven H1/H2).
+
     Parameters
     ----------
     job_ref
@@ -169,13 +177,16 @@ def descargar_resultados_job(job_ref):
     -------
     tuple
         (result_refs, downloaded_results, counts_list, result_ids), donde
-        `counts_list` es la lista de conteos (`collated_counts`) por
-        resultado y `result_ids` sus identificadores como texto.
+        `counts_list` es la lista de conteos por resultado y `result_ids`
+        sus identificadores como texto.
 
     Raises
     ------
     RuntimeError
         Si el job no esta COMPLETED o no tiene resultados descargables.
+    TypeError
+        Si un resultado descargado no ofrece collated_counts() ni
+        get_counts().
     """
     estado_actual = qnx.jobs.status(job_ref).status
     if estado_actual != qnx.jobs.JobStatusEnum.COMPLETED:
@@ -184,12 +195,25 @@ def descargar_resultados_job(job_ref):
             "no tiene resultados finales."
         )
 
-    result_refs = list(qnx.jobs.results(job_ref))
+    fresh_job_ref = qnx.jobs.get(id=job_ref.id)
+    result_refs = list(qnx.jobs.results(fresh_job_ref))
     if not result_refs:
-        raise RuntimeError(f"El job {job_ref.id} no contiene resultados descargables.")
+        raise RuntimeError(
+            f"El job {job_ref.id} ya figura COMPLETED, pero Nexus aun no "
+            "publica resultados descargables. Vuelve a consultar mas tarde."
+        )
 
     downloaded_results = [ref.download_result() for ref in result_refs]
-    counts_list = [resultado.collated_counts() for resultado in downloaded_results]
+    counts_list = []
+    for resultado in downloaded_results:
+        if hasattr(resultado, "collated_counts"):
+            counts_list.append(resultado.collated_counts())
+        elif hasattr(resultado, "get_counts"):
+            counts_list.append(resultado.get_counts())
+        else:
+            raise TypeError(
+                "El resultado descargado no ofrece collated_counts() ni get_counts()."
+            )
     result_ids = [str(ref.id) for ref in result_refs]
 
     return result_refs, downloaded_results, counts_list, result_ids
@@ -434,10 +458,10 @@ def compilar_si_corresponde(allow_new_execution, execution_target, circuito, suf
     raise ValueError('EXECUTION_TARGET debe ser "local" o "nexus_selene"')
 
 
-def ejecutar_local(circuito, n_qubits=2, n_shots=100, seed=42):
+def ejecutar_local(circuito, n_qubits=2, n_shots=100, seed=42, simulator="statevector"):
     """
-    Ejecuta un circuito de guppy en el emulador local (simulador
-    estabilizador) y devuelve el resultado y sus conteos.
+    Ejecuta un circuito de guppy en el emulador local (Selene) y devuelve
+    el resultado y sus conteos.
 
     Parameters
     ----------
@@ -449,6 +473,11 @@ def ejecutar_local(circuito, n_qubits=2, n_shots=100, seed=42):
         Numero de repeticiones. Por defecto 100.
     seed : int, optional
         Semilla para reproducibilidad. Por defecto 42.
+    simulator : str, optional
+        "statevector" (por defecto) o "stabilizer". El statevector es
+        necesario para circuitos con rotaciones arbitrarias (como el
+        kernel ZZ); el stabilizer solo simula programas puramente
+        Clifford, aunque escala a mas qubits.
 
     Returns
     -------
@@ -457,20 +486,32 @@ def ejecutar_local(circuito, n_qubits=2, n_shots=100, seed=42):
         Se usa `collated_counts()` (no `register_counts()`) para que el
         formato de los conteos coincida con el de los jobs de Nexus:
         un diccionario plano ``{tupla_de_pares_(registro, valor): count}``.
+
+    Raises
+    ------
+    ValueError
+        Si `simulator` no es "statevector" ni "stabilizer".
     """
-    result = (
+    emulator = (
         circuito
         .emulator(n_qubits=n_qubits)
-        .stabilizer_sim()
         .with_shots(n_shots)
         .with_seed(seed)
-        .run()
     )
+
+    if simulator == "statevector":
+        emulator = emulator.statevector_sim()
+    elif simulator == "stabilizer":
+        emulator = emulator.stabilizer_sim()
+    else:
+        raise ValueError('simulator debe ser "statevector" o "stabilizer"')
+
+    result = emulator.run()
     counts = result.collated_counts()
     return result, counts
 
 
-def enviar_job_selene(ref_hugr, n_qubits=2, n_shots=100, nombre=None):
+def enviar_job_selene(ref_hugr, n_qubits=2, n_shots=100, nombre=None, simulator="statevector"):
     """
     Envia un HUGR ya subido al simulador Selene de Nexus y devuelve la
     referencia del job (no bloquea; el job queda en cola/ejecucion).
@@ -485,16 +526,29 @@ def enviar_job_selene(ref_hugr, n_qubits=2, n_shots=100, nombre=None):
         Numero de repeticiones. Por defecto 100.
     nombre : str, optional
         Nombre del job.
+    simulator : str, optional
+        "statevector" (por defecto) o "stabilizer". Mismo criterio que en
+        `ejecutar_local`: statevector para rotaciones arbitrarias (kernel
+        ZZ), stabilizer solo para programas Clifford.
 
     Returns
     -------
     job_ref
         Referencia al job de ejecucion enviado.
+
+    Raises
+    ------
+    ValueError
+        Si `simulator` no es "statevector" ni "stabilizer".
     """
-    sim_config = qnx.models.SeleneConfig(
-        n_qubits=n_qubits,
-        simulator=qnx.models.StabilizerSimulator()
-    )
+    if simulator == "statevector":
+        sim = qnx.models.StatevectorSimulator()
+    elif simulator == "stabilizer":
+        sim = qnx.models.StabilizerSimulator()
+    else:
+        raise ValueError('simulator debe ser "statevector" o "stabilizer"')
+
+    sim_config = qnx.models.SeleneConfig(n_qubits=n_qubits, simulator=sim)
     return qnx.start_execute_job(
         programs=[ref_hugr],
         n_shots=[n_shots],
