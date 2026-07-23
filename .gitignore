@@ -26,6 +26,10 @@ cache/
 # seguimiento; el baseline congelado vive en el historial (commit cbb2caf).
 guppy_kernel_handoff/
 
+# Carpeta de migracion de otro programador (kernel para dataset de test).
+# Referencia local para homologar; sin seguimiento en el repo.
+guppy_kernel_test/
+
 # OS files
 .DS_Store
 Thumbs.db

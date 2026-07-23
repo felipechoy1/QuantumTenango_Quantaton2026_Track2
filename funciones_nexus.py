@@ -932,17 +932,196 @@ def zz_feature_map(x):
     return circuit
 
 
-def kernel_circuit_zz(x_i, x_j, remove_barriers=False):
+def agregar_exp_yy(circuit, left, right, parameter):
     """
-    Construye el circuito del kernel ``U(x_j)^dagger U(x_i)`` en pytket.
+    Aplica ``exp(-i * phi * Y_left Y_right)`` con compuertas elementales.
+
+    Cambia de la base Y a la base Z (``Sdg`` + ``H``), aplica la fase
+    conjunta como una interaccion ZZ por paridad (``CX-Rz-CX``) y regresa
+    a la base Y (``H`` + ``S``). No usa PauliExpBox, por lo que el circuito
+    queda inspeccionable puerta por puerta.
+
+    Parameters
+    ----------
+    circuit : pytket.Circuit
+        Circuito sobre el que se agregan las compuertas (in place).
+    left, right : int
+        Qubits sobre los que actua la interaccion YY.
+    parameter : float
+        Angulo de la rotacion Rz central, ya expresado en medias vueltas
+        (``2 * phi / pi``).
+    """
+    # Cambio de base Y -> Z
+    circuit.Sdg(left)
+    circuit.Sdg(right)
+    circuit.H(left)
+    circuit.H(right)
+
+    # Exponencial ZZ mediante paridad
+    circuit.CX(left, right)
+    circuit.Rz(parameter, right)
+    circuit.CX(left, right)
+
+    # Regreso de base Z -> Y
+    circuit.H(left)
+    circuit.H(right)
+    circuit.S(left)
+    circuit.S(right)
+
+
+def pauli_feature_map_zyy(x):
+    """
+    Construye el feature map Pauli ``Z + YY`` (entrelazamiento lineal).
+
+    Aplica una capa de Hadamard, rotaciones Rz individuales (terminos Z,
+    ``phi_i(x) = x_i``) y correlaciones YY entre qubits vecinos
+    (``phi_ij(x) = (pi - x_i)(pi - x_j)``) expandidas con compuertas
+    elementales via `agregar_exp_yy` (sin PauliExpBox). pytket expresa los
+    angulos en medias vueltas, por eso cada angulo se divide entre pi.
+
+    Parameters
+    ----------
+    x : array-like
+        Vector de features escaladas de una observacion; cada feature se
+        codifica en un qubit.
+
+    Returns
+    -------
+    pytket.Circuit
+        Circuito U(x) con barreras entre bloques (utiles para inspeccion
+        visual; se eliminan antes de ejecutar).
+    """
+    x = np.asarray(x, dtype=float)
+    n_qubits = len(x)
+
+    circuit = Circuit(n_qubits, name="Pauli Z+YY lineal")
+    qubits = list(range(n_qubits))
+
+    # Superposicion inicial
+    for i in range(n_qubits):
+        circuit.H(i)
+
+    # Terminos individuales Z; pytket usa medias vueltas.
+    for i in range(n_qubits):
+        circuit.Rz(2 * x[i] / np.pi, i)
+
+    circuit.add_barrier(qubits)
+
+    # Interacciones YY entre qubits vecinos (entrelazamiento lineal)
+    for left in range(n_qubits - 1):
+        right = left + 1
+        phi = (np.pi - x[left]) * (np.pi - x[right])
+        agregar_exp_yy(circuit, left, right, 2 * phi / np.pi)
+        circuit.add_barrier(qubits)
+
+    return circuit
+
+
+def feature_map_ry_cx_rx(x):
+    """
+    Construye el feature map personalizado ``Ry -> cadena CX -> Rx``.
+
+    Cada qubit recibe ``Ry(x_i)``, luego se aplica la cadena lineal de
+    ``CX`` (0->1, 1->2, ...) y finalmente cada qubit recibe ``Rx(x_i)``.
+    pytket expresa las rotaciones en medias vueltas, por eso el angulo
+    fisico ``x_i`` se escribe como ``x_i / pi``.
+
+    Parameters
+    ----------
+    x : array-like
+        Vector de features escaladas de una observacion; cada feature se
+        codifica en un qubit.
+
+    Returns
+    -------
+    pytket.Circuit
+        Circuito U(x) con barreras entre bloques (utiles para inspeccion
+        visual; se eliminan antes de ejecutar).
+    """
+    x = np.asarray(x, dtype=float)
+    n_qubits = len(x)
+
+    circuit = Circuit(n_qubits, name="RY-CX-RX lineal")
+    qubits = list(range(n_qubits))
+
+    # Rotaciones Ry individuales
+    for i in range(n_qubits):
+        circuit.Ry(x[i] / np.pi, i)
+
+    circuit.add_barrier(qubits)
+
+    # Cadena lineal de CX
+    for control in range(n_qubits - 1):
+        circuit.CX(control, control + 1)
+
+    circuit.add_barrier(qubits)
+
+    # Rotaciones Rx individuales
+    for i in range(n_qubits):
+        circuit.Rx(x[i] / np.pi, i)
+
+    return circuit
+
+
+# Registro de feature maps disponibles para el kernel. La clave es el
+# identificador que se pasa como parametro `feature_map`; el valor es el
+# constructor U(x) en pytket. Todos comparten la misma tuberia (mismo
+# `kernel_circuit`, mismo programa guppy, misma extraccion de P(00...0)).
+FEATURE_MAPS = {
+    "zz": zz_feature_map,
+    "zyy": pauli_feature_map_zyy,
+    "ry_cx_rx": feature_map_ry_cx_rx,
+}
+
+
+def obtener_feature_map(feature_map):
+    """
+    Resuelve el parametro `feature_map` a su constructor U(x).
+
+    Parameters
+    ----------
+    feature_map : str or callable
+        Clave de `FEATURE_MAPS` ("zz", "zyy" o "ry_cx_rx") o directamente
+        una funcion ``f(x) -> pytket.Circuit``.
+
+    Returns
+    -------
+    callable
+        La funcion constructora del feature map.
+
+    Raises
+    ------
+    ValueError
+        Si `feature_map` es una cadena que no esta en `FEATURE_MAPS`.
+    """
+    if callable(feature_map):
+        return feature_map
+    try:
+        return FEATURE_MAPS[feature_map]
+    except KeyError:
+        opciones = ", ".join(sorted(FEATURE_MAPS))
+        raise ValueError(
+            f"feature_map '{feature_map}' no reconocido. "
+            f"Opciones: {opciones}."
+        )
+
+
+def kernel_circuit(x_i, x_j, feature_map="zz", remove_barriers=False):
+    """
+    Construye el circuito del kernel ``U(x_j)^dagger U(x_i)`` para el
+    feature map indicado.
 
     La probabilidad de medir ``00...0`` en este circuito estima el kernel
-    de fidelidad ``K(x_i, x_j) = |<phi(x_j)|phi(x_i)>|^2``.
+    de fidelidad ``K(x_i, x_j) = |<phi(x_j)|phi(x_i)>|^2``, cualquiera sea
+    el feature map elegido.
 
     Parameters
     ----------
     x_i, x_j : array-like
         Vectores de features de las dos observaciones a comparar.
+    feature_map : str or callable, optional
+        Feature map a usar: "zz" (default), "zyy" o "ry_cx_rx", o una
+        funcion ``f(x) -> pytket.Circuit``.
     remove_barriers : bool, optional
         Si True, elimina las barreras (necesario antes de cargar el
         circuito en guppy o enviarlo a un backend). Por defecto False,
@@ -953,8 +1132,10 @@ def kernel_circuit_zz(x_i, x_j, remove_barriers=False):
     pytket.Circuit
         Circuito del kernel para el par (x_i, x_j).
     """
-    circuit_xi = zz_feature_map(x_i)
-    circuit_xj_adjoint = zz_feature_map(x_j).dagger()
+    fmap = obtener_feature_map(feature_map)
+
+    circuit_xi = fmap(x_i)
+    circuit_xj_adjoint = fmap(x_j).dagger()
 
     kernel = circuit_xi.copy()
     kernel.append(circuit_xj_adjoint)
@@ -963,6 +1144,29 @@ def kernel_circuit_zz(x_i, x_j, remove_barriers=False):
         RemoveBarriers().apply(kernel)
 
     return kernel
+
+
+def kernel_circuit_zz(x_i, x_j, remove_barriers=False):
+    """
+    Construye el circuito del kernel ZZ ``U(x_j)^dagger U(x_i)``.
+
+    Wrapper retrocompatible de `kernel_circuit` con ``feature_map="zz"``.
+
+    Parameters
+    ----------
+    x_i, x_j : array-like
+        Vectores de features de las dos observaciones a comparar.
+    remove_barriers : bool, optional
+        Si True, elimina las barreras. Por defecto False.
+
+    Returns
+    -------
+    pytket.Circuit
+        Circuito del kernel ZZ para el par (x_i, x_j).
+    """
+    return kernel_circuit(
+        x_i, x_j, feature_map="zz", remove_barriers=remove_barriers
+    )
 
 
 def resumen_kernel_desde_resultado(execution_result, n_qubits):
@@ -1038,7 +1242,7 @@ def resumen_kernel_desde_resultado(execution_result, n_qubits):
     }
 
 
-def crear_programa_kernel_guppy(x_i, x_j):
+def crear_programa_kernel_guppy(x_i, x_j, feature_map="zz"):
     """
     Crea el programa guppy ejecutable para un par del kernel, conservando
     la definicion del circuito en pytket.
@@ -1052,6 +1256,8 @@ def crear_programa_kernel_guppy(x_i, x_j):
     ----------
     x_i, x_j : array-like
         Vectores de features de las dos observaciones a comparar.
+    feature_map : str or callable, optional
+        Feature map a usar ("zz", "zyy" o "ry_cx_rx"). Por defecto "zz".
 
     Returns
     -------
@@ -1059,9 +1265,10 @@ def crear_programa_kernel_guppy(x_i, x_j):
         (pair_program, pair_circuit): el programa guppy verificado con
         ``.check()`` y el circuito pytket subyacente.
     """
-    pair_circuit = kernel_circuit_zz(
+    pair_circuit = kernel_circuit(
         x_i,
         x_j,
+        feature_map=feature_map,
         remove_barriers=True,
     )
     pair_n_qubits = pair_circuit.n_qubits
@@ -1089,6 +1296,7 @@ def ejecutar_kernel_guppy(
     n_shots=1000,
     seed=42,
     simulator="statevector",
+    feature_map="zz",
 ):
     """
     Ejecuta un unico ``K(i, j)`` del kernel en guppy/Selene local.
@@ -1104,6 +1312,8 @@ def ejecutar_kernel_guppy(
     simulator : str, optional
         Simulador local ("statevector" o "stabilizer"). Por defecto
         "statevector", necesario para las rotaciones del kernel ZZ.
+    feature_map : str or callable, optional
+        Feature map a usar ("zz", "zyy" o "ry_cx_rx"). Por defecto "zz".
 
     Returns
     -------
@@ -1111,7 +1321,9 @@ def ejecutar_kernel_guppy(
         Con claves: kernel (la tasa K(i,j)), summary, counts, program,
         pytket_circuit y raw_result.
     """
-    pair_program, pair_circuit = crear_programa_kernel_guppy(x_i, x_j)
+    pair_program, pair_circuit = crear_programa_kernel_guppy(
+        x_i, x_j, feature_map=feature_map
+    )
     pair_result, pair_counts = ejecutar_local(
         pair_program,
         n_qubits=pair_circuit.n_qubits,
@@ -1141,6 +1353,7 @@ def construir_matriz_kernel_guppy(
     seed=42,
     simulator="statevector",
     ejecutar_diagonal=False,
+    feature_map="zz",
 ):
     """
     Construye la matriz kernel simetrica ejecutando un programa guppy por
@@ -1166,6 +1379,8 @@ def construir_matriz_kernel_guppy(
     ejecutar_diagonal : bool, optional
         Si True, tambien ejecuta los pares (i, i); si False, fija la
         diagonal en 1. Por defecto False.
+    feature_map : str or callable, optional
+        Feature map a usar ("zz", "zyy" o "ry_cx_rx"). Por defecto "zz".
 
     Returns
     -------
@@ -1221,6 +1436,7 @@ def construir_matriz_kernel_guppy(
                     n_shots=n_shots,
                     seed=pair_seed,
                     simulator=simulator,
+                    feature_map=feature_map,
                 )
 
                 value = pair["kernel"]
@@ -1380,6 +1596,11 @@ def guardar_kernel_qsvm(
 
     K = np.asarray(matrix_result["kernel_matrix"], dtype=float)
     labels = list(matrix_result["row_labels"])
+    # Para K_test la matriz es rectangular (test x train): las columnas
+    # llevan sus propias etiquetas. Para K_train (cuadrada) col == row.
+    col_labels = list(matrix_result.get("col_labels", labels))
+    es_rectangular = (len(col_labels) != len(labels)) or (col_labels != labels)
+    matrix_kind = "test" if es_rectangular else "train"
     run_summary = matrix_result.get("run_summary")
 
     def _primer_valor(col, default=""):
@@ -1390,12 +1611,15 @@ def guardar_kernel_qsvm(
     meta = {
         "run_id": str(run_id),
         "source": source,
+        "matrix_kind": matrix_kind,
         "job_id": "" if job_id is None else str(job_id),
         "job_name": "" if job_name is None else str(job_name),
         "backend": _primer_valor("backend"),
         "program_format": _primer_valor("program_format"),
         "n_rows": len(labels),
         "rows": ",".join(str(x) for x in labels),
+        "n_cols": len(col_labels),
+        "cols": ",".join(str(x) for x in col_labels),
         "n_qubits": _primer_valor("n_qubits"),
         "shots_per_circuit": matrix_result.get("n_shots_per_circuit", ""),
         "n_circuits": matrix_result.get("n_circuits", ""),
@@ -1406,10 +1630,13 @@ def guardar_kernel_qsvm(
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_run_id = str(run_id).replace("/", "_").replace("\\", "_")
 
-    ruta_matriz = output_dir / f"kernel_qsvm_{safe_run_id}.csv"
-    pd.DataFrame(np.round(K, 6), index=labels, columns=labels).to_csv(ruta_matriz, sep=";")
+    # K_train conserva el nombre historico kernel_qsvm_<run_id>.csv;
+    # K_test lleva el infijo _test_ para no pisar la matriz de train.
+    infijo = "test_" if es_rectangular else ""
+    ruta_matriz = output_dir / f"kernel_qsvm_{infijo}{safe_run_id}.csv"
+    pd.DataFrame(np.round(K, 6), index=labels, columns=col_labels).to_csv(ruta_matriz, sep=";")
 
-    ruta_meta = output_dir / f"kernel_qsvm_{safe_run_id}_meta.csv"
+    ruta_meta = output_dir / f"kernel_qsvm_{infijo}{safe_run_id}_meta.csv"
     pd.DataFrame([meta]).to_csv(ruta_meta, index=False, sep=";")
 
     return ruta_matriz, ruta_meta
@@ -1469,7 +1696,7 @@ def cargar_datos_kernel(ruta="data/processed/df_escalado.csv"):
     return kernel_df, feature_columns, train_df, test_df
 
 
-def seleccionar_par_kernel(train_df, row_i, row_j):
+def seleccionar_par_kernel(train_df, row_i, row_j, feature_map="zz"):
     """
     Valida los indices de un par, construye su circuito de inspeccion
     (con barreras, para visualizarlo) e imprime sus dimensiones.
@@ -1480,6 +1707,8 @@ def seleccionar_par_kernel(train_df, row_i, row_j):
         Particion de train con solo features.
     row_i, row_j : int
         Indices de las filas a comparar.
+    feature_map : str or callable, optional
+        Feature map a usar ("zz", "zyy" o "ry_cx_rx"). Por defecto "zz".
 
     Returns
     -------
@@ -1499,7 +1728,9 @@ def seleccionar_par_kernel(train_df, row_i, row_j):
 
     x_i = train_df.iloc[row_i].to_numpy(dtype=float)
     x_j = train_df.iloc[row_j].to_numpy(dtype=float)
-    preview_circuit = kernel_circuit_zz(x_i, x_j, remove_barriers=False)
+    preview_circuit = kernel_circuit(
+        x_i, x_j, feature_map=feature_map, remove_barriers=False
+    )
 
     print(f"Kernel seleccionado: train[{row_i}] vs train[{row_j}]")
     print("Qubits:", preview_circuit.n_qubits)
@@ -1589,6 +1820,7 @@ def enviar_matriz_kernel_nexus(
     n_shots,
     seed,
     ejecutar_diagonal,
+    feature_map="zz",
 ):
     """
     Sube un programa por par del triangulo de la matriz y envia el job a
@@ -1612,6 +1844,8 @@ def enviar_matriz_kernel_nexus(
         Semilla base (solo registro; los backends remotos no la usan).
     ejecutar_diagonal : bool
         Si True, incluye los pares (i, i).
+    feature_map : str or callable, optional
+        Feature map a usar ("zz", "zyy" o "ry_cx_rx"). Por defecto "zz".
 
     Returns
     -------
@@ -1625,6 +1859,8 @@ def enviar_matriz_kernel_nexus(
     program_format = backend_info["program_format"]
     nexus_target = backend_info["nexus_target"]
     suffix = uuid.uuid4().hex[:8]
+    # Etiqueta del feature map para nombrar jobs/circuitos en Nexus.
+    map_tag = feature_map if isinstance(feature_map, str) else "custom"
 
     pair_metadata = []
     hugr_refs = []
@@ -1643,7 +1879,7 @@ def enviar_matriz_kernel_nexus(
             start_j = i if ejecutar_diagonal else i + 1
 
             for j in range(start_j, n_rows):
-                pair_name = f"zz-matrix-{rows[i]}-{rows[j]}-{suffix}"
+                pair_name = f"{map_tag}-matrix-{rows[i]}-{rows[j]}-{suffix}"
                 metadata = {
                     "matrix_i": i,
                     "matrix_j": j,
@@ -1656,13 +1892,15 @@ def enviar_matriz_kernel_nexus(
                     pair_program, _ = crear_programa_kernel_guppy(
                         matrix_values[i],
                         matrix_values[j],
+                        feature_map=feature_map,
                     )
                     _, pair_ref = compilar_y_subir_hugr(pair_program, pair_name)
                     hugr_refs.append(pair_ref)
                 else:
-                    pair_circuit = kernel_circuit_zz(
+                    pair_circuit = kernel_circuit(
                         matrix_values[i],
                         matrix_values[j],
+                        feature_map=feature_map,
                         remove_barriers=True,
                     )
                     pair_circuit.measure_all()
@@ -1694,7 +1932,7 @@ def enviar_matriz_kernel_nexus(
             programs=hugr_refs,
             n_shots=[n_shots] * len(hugr_refs),
             backend_config=estado["backend_config"],
-            name=f"zz-kernel-matrix-{nexus_target}-{suffix}",
+            name=f"{map_tag}-kernel-matrix-{nexus_target}-{suffix}",
         )
         print("Job de ejecucion HUGR enviado.")
         print("Execute Job ID:", estado["job_ref"].id)
@@ -1704,7 +1942,7 @@ def enviar_matriz_kernel_nexus(
             backend_config=estado["backend_config"],
             optimisation_level=2,
             skip_intermediate_circuits=True,
-            name=f"compile-zz-matrix-{nexus_target}-{suffix}",
+            name=f"compile-{map_tag}-matrix-{nexus_target}-{suffix}",
         )
         print("Circuitos pytket subidos; compile job enviado.")
         print("Compile Job ID:", estado["compile_job_ref"].id)
@@ -1726,6 +1964,7 @@ def iniciar_matriz_kernel(
     ejecutar_diagonal=False,
     guardar=True,
     project_name=None,
+    feature_map="zz",
 ):
     """
     Punto de entrada de la seccion de matriz kernel: valida la seleccion
@@ -1759,6 +1998,8 @@ def iniciar_matriz_kernel(
         Si True (default), guarda el run local en CSV.
     project_name : str, optional
         Proyecto de Nexus (requerido para backends remotos).
+    feature_map : str or callable, optional
+        Feature map a usar ("zz", "zyy" o "ry_cx_rx"). Por defecto "zz".
 
     Returns
     -------
@@ -1807,6 +2048,7 @@ def iniciar_matriz_kernel(
             seed=seed,
             simulator="statevector",
             ejecutar_diagonal=ejecutar_diagonal,
+            feature_map=feature_map,
         )
         if guardar:
             ruta = guardar_matriz_kernel_run(
@@ -1826,6 +2068,237 @@ def iniciar_matriz_kernel(
         n_shots=n_shots,
         seed=seed,
         ejecutar_diagonal=ejecutar_diagonal,
+        feature_map=feature_map,
+    )
+    return estado, None
+
+
+def _extraer_bloque_test(full_result, n_test, test_rows, train_rows):
+    """
+    Recorta el bloque test x train de una matriz kernel conjunta.
+
+    Dada la matriz conjunta ``K([X_test, X_train], [X_test, X_train])``
+    (con las filas de test primero), extrae el bloque superior derecho
+    ``K[:n_test, n_test:]`` = ``K(X_test, X_train)``, que es el kernel
+    rectangular que consume el QSVM para predecir. Es agnostico al feature
+    map: opera solo sobre la matriz numerica ya calculada.
+
+    Parameters
+    ----------
+    full_result : dict
+        Resultado de la matriz conjunta (mismo esquema que
+        `construir_matriz_kernel_guppy`).
+    n_test : int
+        Numero de filas de test (las primeras de la conjunta).
+    test_rows, train_rows : list
+        Indices originales de test y train, para etiquetar filas/columnas.
+
+    Returns
+    -------
+    dict
+        Mismo esquema que `construir_matriz_kernel_guppy` pero rectangular:
+        kernel_matrix (n_test x m), run_summary filtrado a los pares
+        test x train, row_labels (test), col_labels (train), n_circuits y
+        n_shots_per_circuit.
+    """
+    K_full = np.asarray(full_result["kernel_matrix"], dtype=float)
+    n_train = len(train_rows)
+    K_block = K_full[:n_test, n_test:n_test + n_train].copy()
+
+    run_summary = full_result.get("run_summary")
+    if run_summary is not None and len(run_summary):
+        # En el triangulo superior de la conjunta, los pares test x train
+        # son exactamente los que tienen matrix_i en test y matrix_j en train.
+        mask = (
+            (run_summary["matrix_i"] < n_test)
+            & (run_summary["matrix_j"] >= n_test)
+        )
+        bloque_summary = run_summary.loc[mask].copy()
+        # Reetiquetar a los indices reales de test (fila) y train (columna).
+        bloque_summary["row_i"] = bloque_summary["matrix_i"].map(
+            lambda k: test_rows[int(k)]
+        )
+        bloque_summary["row_j"] = bloque_summary["matrix_j"].map(
+            lambda k: train_rows[int(k) - n_test]
+        )
+        n_circuits = len(bloque_summary)
+    else:
+        bloque_summary = run_summary
+        n_circuits = 0
+
+    return {
+        "kernel_matrix": K_block,
+        "run_summary": bloque_summary,
+        "row_labels": list(test_rows),
+        "col_labels": list(train_rows),
+        "n_circuits": n_circuits,
+        "n_shots_per_circuit": full_result.get("n_shots_per_circuit", ""),
+    }
+
+
+def iniciar_matriz_kernel_test(
+    train_df,
+    rows,
+    test_df,
+    backend,
+    run_matrix,
+    test_rows=None,
+    n_shots=1000,
+    seed=42,
+    guardar=True,
+    project_name=None,
+    feature_map="zz",
+):
+    """
+    Construye la matriz kernel de test ``K_test = K(X_test, X_train)``,
+    el kernel rectangular (n_test x m) que un QSVM usa para predecir.
+
+    Reutiliza la maquinaria de matriz cuadrada: apila ``[X_test, X_train]``
+    (test primero), construye la conjunta simetrica
+    ``K([X_test, X_train], [X_test, X_train])`` con los mismos
+    constructores que K_train y recorta el bloque test x train. El precio
+    de reutilizar esa maquinaria es que tambien se computan los bloques
+    test-test y train-train, que se descartan.
+
+    El bloque extraido es puramente fuera de la diagonal de la conjunta,
+    asi que la diagonal nunca se ejecuta (equivale a `ejecutar_diagonal`
+    False, fijado internamente).
+
+    Debe usarse el **mismo `feature_map`** con el que se construyo K_train:
+    de lo contrario ambas matrices no serian comparables y el SVM quedaria
+    inconsistente.
+
+    Parameters
+    ----------
+    train_df : pandas.DataFrame
+        Particion de train con solo features.
+    rows : list of int
+        Indices de las filas de train que forman las columnas de K_test
+        (las mismas que definieron K_train).
+    test_df : pandas.DataFrame
+        Particion de test con solo features.
+    backend : str
+        Uno de `MATRIX_BACKEND_OPTIONS`.
+    run_matrix : bool
+        Interruptor de seguridad; en False solo imprime el plan.
+    test_rows : list of int, optional
+        Indices de las filas de test que forman las filas de K_test. Por
+        defecto, todas las filas de test.
+    n_shots : int, optional
+        Shots por circuito. Por defecto 1000.
+    seed : int, optional
+        Semilla base local. Por defecto 42.
+    guardar : bool, optional
+        Si True (default), guarda el run local en CSV.
+    project_name : str, optional
+        Proyecto de Nexus (requerido para backends remotos).
+    feature_map : str or callable, optional
+        Feature map a usar ("zz", "zyy" o "ry_cx_rx"). Por defecto "zz".
+        Debe coincidir con el de K_train.
+
+    Returns
+    -------
+    tuple
+        (estado, matrix_result): el estado remoto (o None) y el resultado
+        local de K_test (o None). El estado remoto lleva ``kind="test"``
+        para que `consultar_matriz_nexus` recorte el bloque al completarse.
+
+    Raises
+    ------
+    ValueError
+        Si rows/test_rows es invalido, el backend no existe o falta
+        project_name en un backend remoto.
+    IndexError
+        Si algun indice queda fuera de su particion.
+    """
+    if not rows:
+        raise ValueError("MATRIX_ROWS no puede estar vacio.")
+    if min(rows) < 0 or max(rows) >= len(train_df):
+        raise IndexError("Algun indice de MATRIX_ROWS queda fuera de train.")
+    if len(set(rows)) != len(rows):
+        raise ValueError("MATRIX_ROWS no debe contener indices repetidos.")
+
+    if test_rows is None:
+        test_rows = list(range(len(test_df)))
+    if not test_rows:
+        raise ValueError("TEST_ROWS no puede estar vacio.")
+    if min(test_rows) < 0 or max(test_rows) >= len(test_df):
+        raise IndexError("Algun indice de TEST_ROWS queda fuera de test.")
+    if len(set(test_rows)) != len(test_rows):
+        raise ValueError("TEST_ROWS no debe contener indices repetidos.")
+
+    train_input = train_df.iloc[rows].reset_index(drop=True)
+    test_input = test_df.iloc[test_rows].reset_index(drop=True)
+    n_test = len(test_input)
+    n_train = len(train_input)
+
+    # Test primero, train despues: asi K_test queda en el bloque superior
+    # derecho de la conjunta.
+    matrix_input = pd.concat([test_input, train_input], ignore_index=True)
+    joint_labels = list(range(len(matrix_input)))
+
+    backend_info = preparar_backend_matriz(backend, matrix_input.shape[1])
+
+    if not run_matrix:
+        print("Construccion de K_test desactivada.")
+        print("Forma del resultado:", (n_test, n_train))
+        print("Filas de test:", test_rows)
+        print("Columnas de train:", rows)
+        print("Backend seleccionado:", backend)
+        print("Opciones:", MATRIX_BACKEND_OPTIONS)
+        pares_utiles = n_test * n_train
+        circuitos_conjunta = (n_test + n_train) * (n_test + n_train - 1) // 2
+        print("Pares test x train necesarios:", pares_utiles)
+        print(
+            "Circuitos de la conjunta (incluye test-test y train-train):",
+            circuitos_conjunta,
+        )
+        print("Cambia RUN_MATRIX = True cuando quieras iniciar.")
+        return None, None
+
+    if backend_info["execution_target"] == "local":
+        full_result = construir_matriz_kernel_guppy(
+            X=matrix_input,
+            row_labels=joint_labels,
+            n_shots=n_shots,
+            seed=seed,
+            simulator="statevector",
+            ejecutar_diagonal=False,
+            feature_map=feature_map,
+        )
+        matrix_result = _extraer_bloque_test(
+            full_result, n_test, test_rows, rows
+        )
+        if guardar:
+            ruta = guardar_matriz_kernel_run(
+                matrix_result, source="local_statevector_test"
+            )
+            print("Run de K_test guardado en:", ruta)
+        return None, matrix_result
+
+    if project_name is None:
+        raise ValueError("Se requiere project_name para backends de Nexus.")
+    conectar_nexus(project_name)
+    estado = enviar_matriz_kernel_nexus(
+        matrix_input,
+        joint_labels,
+        backend_info,
+        backend,
+        n_shots=n_shots,
+        seed=seed,
+        ejecutar_diagonal=False,
+        feature_map=feature_map,
+    )
+    # Metadatos para que consultar_matriz_nexus recorte el bloque test x train.
+    estado["kind"] = "test"
+    estado["n_test"] = n_test
+    estado["test_rows"] = list(test_rows)
+    estado["train_rows"] = list(rows)
+    print(
+        "Nexus construira la conjunta",
+        (n_test + n_train, n_test + n_train),
+        "; al consultar se recorta K_test",
+        (n_test, n_train),
     )
     return estado, None
 
@@ -1973,11 +2446,26 @@ def consultar_matriz_nexus(estado, guardar=True):
         "n_shots_per_circuit": estado["n_shots"],
     }
 
-    print("Matriz kernel reconstruida.")
+    # Para un job de K_test se reconstruye la conjunta y se recorta el
+    # bloque test x train; para K_train se devuelve la matriz completa.
+    es_test = estado.get("kind") == "test"
+    if es_test:
+        matrix_result = _extraer_bloque_test(
+            matrix_result,
+            estado["n_test"],
+            estado["test_rows"],
+            estado["train_rows"],
+        )
+        source = f"nexus_{estado['backend']}_test"
+        print("Matriz K_test reconstruida (bloque test x train recortado).")
+    else:
+        source = f"nexus_{estado['backend']}"
+        print("Matriz kernel reconstruida.")
+
     if guardar:
         ruta = guardar_matriz_kernel_run(
             matrix_result,
-            source=f"nexus_{estado['backend']}",
+            source=source,
             run_id=str(estado["job_ref"].id),
             job_id=estado["job_ref"].id,
             job_name=getattr(estado["job_ref"].annotations, "name", None),
