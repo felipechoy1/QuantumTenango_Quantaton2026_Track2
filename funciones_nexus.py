@@ -1696,6 +1696,109 @@ def cargar_datos_kernel(ruta="data/processed/df_escalado.csv"):
     return kernel_df, feature_columns, train_df, test_df
 
 
+NIVELES_MUESTREO = {"3": 3, "3+2": 2, "3+2+1": 1}
+
+
+def cargar_datos_kernel_muestreo(
+    ruta_excel,
+    nivel_train,
+    nivel_test,
+    sheet_name="muestreos",
+    objetivo="Potability",
+    particion="_PartInd_",
+    columna_muestreo="_Muestreo_",
+):
+    """
+    Carga el subconjunto de filas de la hoja "muestreos" (generada por
+    `asignar_muestreo_balanceado` + `guardar_muestreo_excel` en el pipeline
+    v1) y lo separa en train/test, filtrando cada particion por su propio
+    nivel de muestreo jerarquico.
+
+    Por el anidamiento del muestreo, la submuestra de nivel ``k`` son las
+    filas con ``_Muestreo_ >= k`` (ver docstring de
+    `asignar_muestreo_balanceado`): nivel 3 es la mas profunda (mas
+    pequena), nivel 1 es la muestra completa. El nombre de los niveles en
+    `NIVELES_MUESTREO` seguido la notacion del usuario: "3" (solo la
+    submuestra mas chica), "3+2" (union de las dos mas chicas) y "3+2+1"
+    (la muestra completa).
+
+    Nota importante: la hoja "muestreos" viene del pipeline v1 (entorno
+    qsvm), con su propio split e imputacion/escalado. No esta alineada
+    fila a fila con `data/processed/df_escalado.csv` (pipeline del
+    handoff/guppy): son dos escalados independientes del mismo dataset
+    crudo, asi que no se deben cruzar por indice. Usar esta funcion
+    implica que el kernel consume las features escaladas del pipeline v1
+    para las filas seleccionadas, no las de `df_escalado.csv`.
+
+    Parameters
+    ----------
+    ruta_excel : str
+        Ruta del Excel con la hoja de muestreos (por ejemplo
+        "data/processed/dataset_v1.xlsx").
+    nivel_train, nivel_test : int
+        Nivel minimo de muestreo (1, 2 o 3) para train y test,
+        respectivamente. Independientes entre si. Usar
+        `NIVELES_MUESTREO["3"|"3+2"|"3+2+1"]` para traducir la notacion
+        del usuario a este entero.
+    sheet_name : str, optional
+        Hoja del Excel. Por defecto "muestreos".
+    objetivo : str, optional
+        Columna objetivo a excluir de las features. Por defecto
+        "Potability".
+    particion : str, optional
+        Columna de particion train/test. Por defecto "_PartInd_".
+    columna_muestreo : str, optional
+        Columna con el nivel de muestreo. Por defecto "_Muestreo_".
+
+    Returns
+    -------
+    tuple
+        (kernel_df, feature_columns, train_df, test_df): el subconjunto
+        completo de la hoja (sin filtrar por nivel), la lista de columnas
+        de features y las particiones train/test ya filtradas por su
+        nivel, solo con features.
+
+    Raises
+    ------
+    ValueError
+        Si algun nivel no esta en {1, 2, 3} o el filtro resultante queda
+        vacio para alguna particion.
+    """
+    if nivel_train not in (1, 2, 3):
+        raise ValueError("nivel_train debe ser 1, 2 o 3.")
+    if nivel_test not in (1, 2, 3):
+        raise ValueError("nivel_test debe ser 1, 2 o 3.")
+
+    kernel_df = pd.read_excel(ruta_excel, sheet_name=sheet_name)
+    feature_columns = [
+        column
+        for column in kernel_df.columns
+        if column not in {objetivo, particion, columna_muestreo}
+    ]
+
+    train_df = (
+        kernel_df.loc[
+            (kernel_df[particion] == 0) & (kernel_df[columna_muestreo] >= nivel_train),
+            feature_columns,
+        ]
+        .reset_index(drop=True)
+    )
+    test_df = (
+        kernel_df.loc[
+            (kernel_df[particion] == 1) & (kernel_df[columna_muestreo] >= nivel_test),
+            feature_columns,
+        ]
+        .reset_index(drop=True)
+    )
+
+    if train_df.empty:
+        raise ValueError(f"El filtro de train (nivel {nivel_train}) no devolvio filas.")
+    if test_df.empty:
+        raise ValueError(f"El filtro de test (nivel {nivel_test}) no devolvio filas.")
+
+    return kernel_df, feature_columns, train_df, test_df
+
+
 def seleccionar_par_kernel(train_df, row_i, row_j, feature_map="zz"):
     """
     Valida los indices de un par, construye su circuito de inspeccion
