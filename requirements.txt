@@ -12,3 +12,6 @@ ipykernel>=6,<8
 pennylane>=0.45,<1
 tqdm>=4.69,<5
 openpyxl>=3.1,<4
+guppylang>=0.21,<1
+qnexus>=0.46,<1
+pytket>=2.18,<3
