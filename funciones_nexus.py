@@ -1036,93 +1036,6 @@ def resumen_kernel_desde_resultado(execution_result, n_qubits):
     }
 
 
-def tabla_resumen_kernel(summary, row_i, row_j, source):
-    """
-    Crea la vista compacta (una fila) del resumen de un par del kernel.
-
-    Parameters
-    ----------
-    summary : dict
-        Resumen devuelto por `resumen_kernel_desde_resultado`.
-    row_i, row_j : int
-        Indices de las filas comparadas.
-    source : str
-        Origen de la ejecucion (por ejemplo "local_statevector").
-
-    Returns
-    -------
-    pandas.DataFrame
-        Tabla de una fila con el par y su resumen.
-    """
-    return pd.DataFrame([{
-        "source": source,
-        "row_i": int(row_i),
-        "row_j": int(row_j),
-        **summary,
-    }])
-
-
-def guardar_resumen_kernel_csv(
-    summary,
-    row_i,
-    row_j,
-    source,
-    run_id=None,
-    job_id=None,
-    job_name=None,
-    directory="data/runs",
-):
-    """
-    Guarda en CSV el resumen compacto de una ejecucion de un par del
-    kernel (una sola fila por ejecucion).
-
-    Parameters
-    ----------
-    summary : dict
-        Resumen devuelto por `resumen_kernel_desde_resultado`.
-    row_i, row_j : int
-        Indices de las filas comparadas.
-    source : str
-        Origen de la ejecucion.
-    run_id : optional
-        Identificador de la ejecucion; si no se pasa, se usa el job_id o
-        se genera uno local nuevo.
-    job_id, job_name : optional
-        Identificadores del job de Nexus, si aplica.
-    directory : str, optional
-        Carpeta destino. Por defecto "data/runs".
-
-    Returns
-    -------
-    pathlib.Path
-        Ruta del CSV generado (``kernel_run_<run_id>.csv``), con
-        separador ";" como el resto de los CSV del proyecto.
-    """
-    if run_id is None:
-        run_id = str(job_id) if job_id is not None else f"local-{uuid.uuid4().hex[:12]}"
-
-    row = {
-        "run_id": str(run_id),
-        "source": source,
-        "job_id": "" if job_id is None else str(job_id),
-        "job_name": "" if job_name is None else str(job_name),
-        "row_i": int(row_i),
-        "row_j": int(row_j),
-        "n_qubits": len(summary["zero_state"]),
-        "zero_state": summary["zero_state"],
-        "zero_count": summary["zero_count"],
-        "shots": summary["shots"],
-        "kernel_rate": summary["kernel_rate"],
-    }
-
-    output_dir = Path(directory)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_run_id = str(run_id).replace("/", "_").replace("\\", "_")
-    output_path = output_dir / f"kernel_run_{safe_run_id}.csv"
-    pd.DataFrame([row]).to_csv(output_path, index=False, sep=";")
-    return output_path
-
-
 def crear_programa_kernel_guppy(x_i, x_j):
     """
     Crea el programa guppy ejecutable para un par del kernel, conservando
@@ -1408,6 +1321,111 @@ def guardar_matriz_kernel_run(
     return output_path
 
 
+def guardar_kernel_qsvm(
+    matrix_result,
+    source,
+    job_id=None,
+    job_name=None,
+    run_id=None,
+    directory="data/runs",
+):
+    """
+    Guarda la matriz de Gram del kernel en formato cuadrado, lista para
+    usarse como kernel precomputado en un SVM (``SVC(kernel="precomputed")``),
+    junto con un CSV de metadatos que documenta su procedencia.
+
+    A diferencia de `guardar_matriz_kernel_run` (formato largo, una fila
+    por circuito para inspeccion), aqui se persiste el artefacto final: la
+    matriz cuadrada K etiquetada por observacion. Genera dos archivos con
+    separador ";":
+
+    - ``kernel_qsvm_<run_id>.csv``: la matriz K, con filas y columnas
+      etiquetadas por los indices de las observaciones (`row_labels`).
+    - ``kernel_qsvm_<run_id>_meta.csv``: una fila con la procedencia
+      (source/backend, job_id, shots, numero de filas, qubits, etc.).
+
+    Parameters
+    ----------
+    matrix_result : dict
+        Resultado devuelto por `construir_matriz_kernel_guppy` o
+        reconstruido por `consultar_matriz_nexus`.
+    source : str
+        Origen de la ejecucion (por ejemplo "local_statevector" o
+        "nexus_H1-1LE").
+    job_id, job_name : optional
+        Identificadores del job de Nexus, si aplica.
+    run_id : optional
+        Identificador de la matriz; si no se pasa, se usa el job_id o se
+        genera uno local nuevo. El nombre del archivo se deriva de el, asi
+        que reguardar la misma matriz remota reemplaza el archivo.
+    directory : str, optional
+        Carpeta destino. Por defecto "data/runs".
+
+    Returns
+    -------
+    tuple of pathlib.Path
+        (ruta_matriz, ruta_meta).
+    """
+    from datetime import datetime, timezone
+
+    if run_id is None:
+        run_id = str(job_id) if job_id is not None else f"kernel-local-{uuid.uuid4().hex[:12]}"
+
+    K = np.asarray(matrix_result["kernel_matrix"], dtype=float)
+    labels = list(matrix_result["row_labels"])
+    run_summary = matrix_result.get("run_summary")
+
+    def _primer_valor(col, default=""):
+        if run_summary is not None and col in run_summary.columns and len(run_summary):
+            return run_summary[col].iloc[0]
+        return default
+
+    meta = {
+        "run_id": str(run_id),
+        "source": source,
+        "job_id": "" if job_id is None else str(job_id),
+        "job_name": "" if job_name is None else str(job_name),
+        "backend": _primer_valor("backend"),
+        "program_format": _primer_valor("program_format"),
+        "n_rows": len(labels),
+        "rows": ",".join(str(x) for x in labels),
+        "n_qubits": _primer_valor("n_qubits"),
+        "shots_per_circuit": matrix_result.get("n_shots_per_circuit", ""),
+        "n_circuits": matrix_result.get("n_circuits", ""),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+    output_dir = Path(directory)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_run_id = str(run_id).replace("/", "_").replace("\\", "_")
+
+    ruta_matriz = output_dir / f"kernel_qsvm_{safe_run_id}.csv"
+    pd.DataFrame(K, index=labels, columns=labels).to_csv(ruta_matriz, sep=";")
+
+    ruta_meta = output_dir / f"kernel_qsvm_{safe_run_id}_meta.csv"
+    pd.DataFrame([meta]).to_csv(ruta_meta, index=False, sep=";")
+
+    return ruta_matriz, ruta_meta
+
+
+def cargar_kernel_qsvm(ruta_matriz):
+    """
+    Carga una matriz de Gram guardada por `guardar_kernel_qsvm`.
+
+    Parameters
+    ----------
+    ruta_matriz : str or pathlib.Path
+        Ruta del CSV de la matriz (``kernel_qsvm_<run_id>.csv``).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Matriz cuadrada con filas y columnas etiquetadas por observacion.
+        Para un SVM, usar ``.to_numpy()`` con ``SVC(kernel="precomputed")``.
+    """
+    return pd.read_csv(ruta_matriz, sep=";", index_col=0)
+
+
 def cargar_datos_kernel(ruta="data/processed/df_escalado.csv"):
     """
     Carga el dataset escalado del kernel y lo separa en train/test segun
@@ -1481,160 +1499,6 @@ def seleccionar_par_kernel(train_df, row_i, row_j):
     print("Puertas:", preview_circuit.n_gates)
     print("Profundidad:", preview_circuit.depth())
     return x_i, x_j, preview_circuit
-
-
-def ejecutar_par_kernel(
-    x_i,
-    x_j,
-    run_kernel,
-    execution_target,
-    row_i,
-    row_j,
-    n_shots=1000,
-    seed=42,
-    guardar=True,
-    project_name=None,
-):
-    """
-    Ejecuta el kernel de un par segun el interruptor y el destino.
-
-    - ``run_kernel=False``: no ejecuta nada (interruptor de seguridad).
-    - ``execution_target="local"``: corre el par en Selene local y
-      devuelve el resumen (opcionalmente guardado en CSV).
-    - ``execution_target="nexus_selene"``: compila el programa guppy,
-      lo sube y envia el job remoto; el resultado se recoge despues con
-      `consultar_par_kernel`.
-
-    Parameters
-    ----------
-    x_i, x_j : array-like
-        Vectores de features del par.
-    run_kernel : bool
-        Interruptor de seguridad; en False solo imprime el aviso.
-    execution_target : str
-        "local" o "nexus_selene".
-    row_i, row_j : int
-        Indices de las filas comparadas (para nombres y registro).
-    n_shots : int, optional
-        Shots por ejecucion. Por defecto 1000.
-    seed : int, optional
-        Semilla local. Por defecto 42.
-    guardar : bool, optional
-        Si True (default), guarda el resumen local en CSV.
-    project_name : str, optional
-        Proyecto de Nexus (requerido para el destino remoto).
-
-    Returns
-    -------
-    tuple
-        (job_ref, summary): la referencia del job remoto (o None) y el
-        resumen local (o None).
-
-    Raises
-    ------
-    ValueError
-        Si el destino no es valido o falta project_name en remoto.
-    """
-    if not run_kernel:
-        print("Ejecucion desactivada.")
-        print(
-            "Revisa el circuito y luego cambia RUN_KERNEL = True "
-            f"para ejecutar train[{row_i}] vs train[{row_j}]."
-        )
-        return None, None
-
-    if execution_target == "local":
-        pair = ejecutar_kernel_guppy(x_i, x_j, n_shots=n_shots, seed=seed)
-        print(f"Simulacion local finalizada. K({row_i},{row_j}) = {pair['kernel']:.4f}")
-        if guardar:
-            ruta = guardar_resumen_kernel_csv(
-                summary=pair["summary"], row_i=row_i, row_j=row_j,
-                source="local_statevector",
-            )
-            print("Resumen del kernel guardado en:", ruta)
-        return None, pair["summary"]
-
-    if execution_target == "nexus_selene":
-        if project_name is None:
-            raise ValueError("Se requiere project_name para el destino remoto.")
-        conectar_nexus(project_name)
-        suffix = uuid.uuid4().hex[:8]
-
-        pair_program, pair_circuit = crear_programa_kernel_guppy(x_i, x_j)
-        _, ref_hugr = compilar_y_subir_hugr(
-            pair_program, f"zz-kernel-{row_i}-{row_j}-{suffix}"
-        )
-        job_ref = enviar_job_selene(
-            ref_hugr,
-            n_qubits=pair_circuit.n_qubits,
-            n_shots=n_shots,
-            nombre=f"zz-kernel-selene-{row_i}-{row_j}-{suffix}",
-        )
-        submit_status = qnx.jobs.status(job_ref)
-
-        print("Job enviado a Selene/Nexus.")
-        print("Job ID:", job_ref.id)
-        print("Estado inicial:", submit_status.status)
-        print("Usa la celda de consulta para obtener el resultado.")
-        return job_ref, None
-
-    raise ValueError('EXECUTION_TARGET debe ser "local" o "nexus_selene"')
-
-
-def consultar_par_kernel(job_ref, n_qubits, row_i, row_j, guardar=True):
-    """
-    Consulta el job remoto de un par del kernel sin bloquear; cuando
-    termina, extrae el resumen (y opcionalmente lo guarda en CSV).
-
-    Parameters
-    ----------
-    job_ref
-        Referencia del job remoto enviado por `ejecutar_par_kernel`, o
-        None si no se envio ninguno.
-    n_qubits : int
-        Numero de qubits del circuito del par.
-    row_i, row_j : int
-        Indices de las filas comparadas.
-    guardar : bool, optional
-        Si True (default), guarda el resumen en CSV al terminar.
-
-    Returns
-    -------
-    dict or None
-        El resumen del kernel si el job ya esta COMPLETED; None si aun
-        no hay job o sigue en curso.
-
-    Raises
-    ------
-    RuntimeError
-        Si el job termino con error o fue cancelado.
-    """
-    if job_ref is None:
-        print("No hay un job remoto nuevo que consultar.")
-        return None
-
-    status = qnx.jobs.status(job_ref)
-    print("Estado:", status.status)
-    print("Mensaje:", status.message)
-
-    if "COMPLETED" in str(status.status):
-        _, downloaded, _, _ = descargar_resultados_job(job_ref)
-        summary = resumen_kernel_desde_resultado(downloaded[0], n_qubits)
-        if guardar:
-            ruta = guardar_resumen_kernel_csv(
-                summary=summary, row_i=row_i, row_j=row_j,
-                source="nexus_selene_statevector",
-                job_id=job_ref.id,
-                job_name=getattr(job_ref.annotations, "name", None),
-            )
-            print("Resumen del kernel guardado en:", ruta)
-        return summary
-
-    if "ERROR" in str(status.status) or "CANCELLED" in str(status.status):
-        raise RuntimeError(f"El job termino sin exito: {status}")
-
-    print("El job sigue en cola o ejecucion. Consulta nuevamente mas tarde.")
-    return None
 
 
 MATRIX_BACKEND_OPTIONS = [
@@ -1999,6 +1863,7 @@ def consultar_matriz_nexus(estado, guardar=True):
 
     if estado["compile_job_ref"] is not None and estado["job_ref"] is None:
         compile_status = qnx.jobs.status(estado["compile_job_ref"])
+        print("Compile Job ID:", estado["compile_job_ref"].id)
         print("Compile status:", compile_status.status)
         print("Compile message:", compile_status.message)
 
@@ -2034,6 +1899,7 @@ def consultar_matriz_nexus(estado, guardar=True):
         return estado, None
 
     matrix_status = qnx.jobs.status(estado["job_ref"])
+    print("Execute Job ID:", estado["job_ref"].id)
     print("Execute status:", matrix_status.status)
     print("Execute message:", matrix_status.message)
 
@@ -2044,7 +1910,12 @@ def consultar_matriz_nexus(estado, guardar=True):
     if matrix_status.status != qnx.jobs.JobStatusEnum.COMPLETED:
         if matrix_status.status.value in terminal_errors:
             raise RuntimeError(f"El execute job termino sin exito: {matrix_status}")
-        print("La ejecucion continua. Reejecuta esta celda mas tarde.")
+        print(
+            "El execute job aun no esta COMPLETED (estado consultado en vivo). "
+            "Reejecuta esta celda mas tarde; confirma que este Execute Job ID sea "
+            "el mismo que figura COMPLETED en Nexus (en H1/H2 el compile job es un "
+            "job aparte y termina antes que el execute)."
+        )
         return estado, None
 
     _, matrix_downloaded, _, matrix_result_ids = descargar_resultados_job(
