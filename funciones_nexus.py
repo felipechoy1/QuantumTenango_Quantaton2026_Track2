@@ -5,16 +5,28 @@ simulador local (guppy/Selene): conexion, listado y seleccion de jobs,
 descarga de resultados, compilacion/envio de circuitos, ejecucion local y
 guardado de resultados en CSV.
 
-Este modulo esta pensado para el entorno Conda `quantum_space`, que es el
-unico que tiene `qnexus`, `ipywidgets` y `guppylang` instalados.
+Incluye tambien la logica del kernel cuantico ZZ para QSVM: feature map en
+pytket, circuito U(x_j)^dagger U(x_i), puente pytket->guppy, ejecucion por
+pares y construccion de la matriz kernel.
+
+Este modulo requiere `qnexus`, `ipywidgets`, `guppylang` y `pytket`
+(disponibles en los entornos Conda `quantum_space` y `qsvm`).
 """
 
 import os
 import uuid
+from pathlib import Path
 
 import ipywidgets as widgets
+import numpy as np
 import pandas as pd
 import qnexus as qnx
+from guppylang import guppy
+from guppylang.std.builtins import array, comptime, result
+from guppylang.std.quantum import measure_array, qubit
+from pytket import Circuit
+from pytket.passes import RemoveBarriers
+from tqdm.auto import tqdm
 
 
 def conectar_nexus(project_name):
@@ -869,3 +881,503 @@ def guardar_resultado_actual(
         "No hay una ejecucion cargada para guardar. Corre una simulacion local, "
         "selecciona un job de Nexus, o espera a que termine un job nuevo."
     )
+
+
+def zz_feature_map(x):
+    """
+    Construye el feature map ZZ ``U(x)`` enteramente en pytket.
+
+    Aplica una capa de Hadamard, rotaciones Rz individuales proporcionales
+    a cada feature y correlaciones ZZ (CX-Rz-CX) entre cada par de qubits.
+    pytket expresa los angulos en medias vueltas, por eso cada angulo se
+    divide entre pi.
+
+    Parameters
+    ----------
+    x : array-like
+        Vector de features escaladas de una observacion; cada feature se
+        codifica en un qubit.
+
+    Returns
+    -------
+    pytket.Circuit
+        Circuito U(x) con barreras entre bloques (utiles para inspeccion
+        visual; se eliminan antes de ejecutar).
+    """
+    x = np.asarray(x, dtype=float)
+    n_qubits = len(x)
+
+    circuit = Circuit(n_qubits, name="ZZ Feature Map")
+    qubits = list(range(n_qubits))
+
+    # Embedding individual
+    for i in range(n_qubits):
+        circuit.H(i)
+
+    # pytket expresa los angulos en medias vueltas.
+    for i in range(n_qubits):
+        circuit.Rz(2 * x[i] / np.pi, i)
+
+    circuit.add_barrier(qubits)
+
+    # Correlaciones ZZ
+    for i in range(n_qubits):
+        for j in range(i + 1, n_qubits):
+            angle = 2 * (np.pi - x[i]) * (np.pi - x[j])
+            circuit.CX(i, j)
+            circuit.Rz(angle / np.pi, j)
+            circuit.CX(i, j)
+            circuit.add_barrier(qubits)
+
+    return circuit
+
+
+def kernel_circuit_zz(x_i, x_j, remove_barriers=False):
+    """
+    Construye el circuito del kernel ``U(x_j)^dagger U(x_i)`` en pytket.
+
+    La probabilidad de medir ``00...0`` en este circuito estima el kernel
+    de fidelidad ``K(x_i, x_j) = |<phi(x_j)|phi(x_i)>|^2``.
+
+    Parameters
+    ----------
+    x_i, x_j : array-like
+        Vectores de features de las dos observaciones a comparar.
+    remove_barriers : bool, optional
+        Si True, elimina las barreras (necesario antes de cargar el
+        circuito en guppy o enviarlo a un backend). Por defecto False,
+        para conservarlas en la inspeccion visual.
+
+    Returns
+    -------
+    pytket.Circuit
+        Circuito del kernel para el par (x_i, x_j).
+    """
+    circuit_xi = zz_feature_map(x_i)
+    circuit_xj_adjoint = zz_feature_map(x_j).dagger()
+
+    kernel = circuit_xi.copy()
+    kernel.append(circuit_xj_adjoint)
+
+    if remove_barriers:
+        RemoveBarriers().apply(kernel)
+
+    return kernel
+
+
+def resumen_kernel_desde_resultado(execution_result, n_qubits):
+    """
+    Extrae el conteo del estado ``00...0`` de un resultado de ejecucion,
+    que es lo unico que participa en el kernel de fidelidad.
+
+    Soporta los dos tipos de resultado del flujo:
+
+    - Guppy/Selene: expone ``register_counts()`` y los conteos del kernel
+      estan bajo la etiqueta ``"kernel_measurement"``.
+    - BackendResult de pytket (H1/H2): expone ``get_counts()`` con
+      outcomes en tuplas de bits.
+
+    Parameters
+    ----------
+    execution_result
+        Resultado devuelto por el emulador local o descargado de Nexus.
+    n_qubits : int
+        Numero de qubits del circuito (define el estado cero esperado).
+
+    Returns
+    -------
+    dict
+        Con claves: zero_state, zero_count, shots, kernel_rate
+        (``zero_count / shots``).
+
+    Raises
+    ------
+    TypeError
+        Si el resultado no ofrece register_counts() ni get_counts().
+    """
+    zero_state = "0" * n_qubits
+
+    if hasattr(execution_result, "register_counts"):
+        # Guppy/Selene: conteos agrupados por etiqueta de result().
+        register_counts = execution_result.register_counts()
+        kernel_counts = register_counts["kernel_measurement"]
+        shots = int(sum(kernel_counts.values()))
+        zero_count = int(kernel_counts.get(zero_state, 0))
+
+    elif hasattr(execution_result, "get_counts"):
+        # Circuitos pytket en H1/H2: Counter con outcomes de bits.
+        kernel_counts = execution_result.get_counts()
+        shots = int(sum(kernel_counts.values()))
+        zero_count = 0
+
+        for outcome, count in kernel_counts.items():
+            try:
+                is_zero = all(int(bit) == 0 for bit in outcome)
+            except TypeError:
+                is_zero = str(outcome).replace(" ", "") in {
+                    zero_state,
+                    f"({','.join('0' for _ in range(n_qubits))})",
+                }
+            if is_zero:
+                zero_count += int(count)
+
+    else:
+        raise TypeError(
+            "Tipo de resultado no soportado: se esperaba un resultado "
+            "Guppy con register_counts() o BackendResult con get_counts()."
+        )
+
+    kernel_rate = zero_count / shots if shots else 0.0
+    return {
+        "zero_state": zero_state,
+        "zero_count": zero_count,
+        "shots": shots,
+        "kernel_rate": kernel_rate,
+    }
+
+
+def tabla_resumen_kernel(summary, row_i, row_j, source):
+    """
+    Crea la vista compacta (una fila) del resumen de un par del kernel.
+
+    Parameters
+    ----------
+    summary : dict
+        Resumen devuelto por `resumen_kernel_desde_resultado`.
+    row_i, row_j : int
+        Indices de las filas comparadas.
+    source : str
+        Origen de la ejecucion (por ejemplo "local_statevector").
+
+    Returns
+    -------
+    pandas.DataFrame
+        Tabla de una fila con el par y su resumen.
+    """
+    return pd.DataFrame([{
+        "source": source,
+        "row_i": int(row_i),
+        "row_j": int(row_j),
+        **summary,
+    }])
+
+
+def guardar_resumen_kernel_csv(
+    summary,
+    row_i,
+    row_j,
+    source,
+    run_id=None,
+    job_id=None,
+    job_name=None,
+    directory="data/runs",
+):
+    """
+    Guarda en CSV el resumen compacto de una ejecucion de un par del
+    kernel (una sola fila por ejecucion).
+
+    Parameters
+    ----------
+    summary : dict
+        Resumen devuelto por `resumen_kernel_desde_resultado`.
+    row_i, row_j : int
+        Indices de las filas comparadas.
+    source : str
+        Origen de la ejecucion.
+    run_id : optional
+        Identificador de la ejecucion; si no se pasa, se usa el job_id o
+        se genera uno local nuevo.
+    job_id, job_name : optional
+        Identificadores del job de Nexus, si aplica.
+    directory : str, optional
+        Carpeta destino. Por defecto "data/runs".
+
+    Returns
+    -------
+    pathlib.Path
+        Ruta del CSV generado (``kernel_run_<run_id>.csv``).
+    """
+    if run_id is None:
+        run_id = str(job_id) if job_id is not None else f"local-{uuid.uuid4().hex[:12]}"
+
+    row = {
+        "run_id": str(run_id),
+        "source": source,
+        "job_id": "" if job_id is None else str(job_id),
+        "job_name": "" if job_name is None else str(job_name),
+        "row_i": int(row_i),
+        "row_j": int(row_j),
+        "n_qubits": len(summary["zero_state"]),
+        "zero_state": summary["zero_state"],
+        "zero_count": summary["zero_count"],
+        "shots": summary["shots"],
+        "kernel_rate": summary["kernel_rate"],
+    }
+
+    output_dir = Path(directory)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_run_id = str(run_id).replace("/", "_").replace("\\", "_")
+    output_path = output_dir / f"kernel_run_{safe_run_id}.csv"
+    pd.DataFrame([row]).to_csv(output_path, index=False)
+    return output_path
+
+
+def crear_programa_kernel_guppy(x_i, x_j):
+    """
+    Crea el programa guppy ejecutable para un par del kernel, conservando
+    la definicion del circuito en pytket.
+
+    El circuito ``U(x_j)^dagger U(x_i)`` se construye en pytket (sin
+    barreras), se carga en guppy con `guppy.load_pytket` y se envuelve en
+    un programa que reserva los qubits, aplica el kernel y mide todo bajo
+    la etiqueta ``"kernel_measurement"``.
+
+    Parameters
+    ----------
+    x_i, x_j : array-like
+        Vectores de features de las dos observaciones a comparar.
+
+    Returns
+    -------
+    tuple
+        (pair_program, pair_circuit): el programa guppy verificado con
+        ``.check()`` y el circuito pytket subyacente.
+    """
+    pair_circuit = kernel_circuit_zz(
+        x_i,
+        x_j,
+        remove_barriers=True,
+    )
+    pair_n_qubits = pair_circuit.n_qubits
+
+    pair_kernel = guppy.load_pytket(
+        "pair_kernel",
+        pair_circuit,
+        use_arrays=True,
+    )
+
+    @guppy
+    def pair_program() -> None:
+        qs = array(qubit() for _ in range(comptime(pair_n_qubits)))
+        pair_kernel(qs)
+        measurements = measure_array(qs)
+        result("kernel_measurement", measurements)
+
+    pair_program.check()
+    return pair_program, pair_circuit
+
+
+def ejecutar_kernel_guppy(
+    x_i,
+    x_j,
+    n_shots=1000,
+    seed=42,
+    simulator="statevector",
+):
+    """
+    Ejecuta un unico ``K(i, j)`` del kernel en guppy/Selene local.
+
+    Parameters
+    ----------
+    x_i, x_j : array-like
+        Vectores de features de las dos observaciones a comparar.
+    n_shots : int, optional
+        Numero de repeticiones. Por defecto 1000.
+    seed : int, optional
+        Semilla para reproducibilidad. Por defecto 42.
+    simulator : str, optional
+        Simulador local ("statevector" o "stabilizer"). Por defecto
+        "statevector", necesario para las rotaciones del kernel ZZ.
+
+    Returns
+    -------
+    dict
+        Con claves: kernel (la tasa K(i,j)), summary, counts, program,
+        pytket_circuit y raw_result.
+    """
+    pair_program, pair_circuit = crear_programa_kernel_guppy(x_i, x_j)
+    pair_result, pair_counts = ejecutar_local(
+        pair_program,
+        n_qubits=pair_circuit.n_qubits,
+        n_shots=n_shots,
+        seed=seed,
+        simulator=simulator,
+    )
+    summary = resumen_kernel_desde_resultado(
+        pair_result,
+        pair_circuit.n_qubits,
+    )
+
+    return {
+        "kernel": summary["kernel_rate"],
+        "summary": summary,
+        "counts": pair_counts,
+        "program": pair_program,
+        "pytket_circuit": pair_circuit,
+        "raw_result": pair_result,
+    }
+
+
+def construir_matriz_kernel_guppy(
+    X,
+    row_labels=None,
+    n_shots=1000,
+    seed=42,
+    simulator="statevector",
+    ejecutar_diagonal=False,
+):
+    """
+    Construye la matriz kernel simetrica ejecutando un programa guppy por
+    par en el simulador local.
+
+    Solo se ejecuta el triangulo superior; cada valor se refleja por
+    simetria (``K(i,j) = K(j,i)``). La diagonal puede fijarse en 1 sin
+    ejecutar circuitos, ya que idealmente ``K(x_i, x_i) = 1``.
+
+    Parameters
+    ----------
+    X : pandas.DataFrame or array-like
+        Matriz (n_filas, n_features) con las observaciones.
+    row_labels : list, optional
+        Etiquetas de las filas (por ejemplo, sus indices originales en
+        train). Por defecto 0..n-1.
+    n_shots : int, optional
+        Shots por circuito. Por defecto 1000.
+    seed : int, optional
+        Semilla base; cada par usa ``seed + i * n + j``. Por defecto 42.
+    simulator : str, optional
+        Simulador local. Por defecto "statevector".
+    ejecutar_diagonal : bool, optional
+        Si True, tambien ejecuta los pares (i, i); si False, fija la
+        diagonal en 1. Por defecto False.
+
+    Returns
+    -------
+    dict
+        Con claves: kernel_matrix (numpy.ndarray), run_summary
+        (DataFrame con una fila por circuito), row_labels, n_circuits y
+        n_shots_per_circuit.
+
+    Raises
+    ------
+    ValueError
+        Si X no es bidimensional o row_labels no coincide en longitud.
+    """
+    if isinstance(X, pd.DataFrame):
+        X_values = X.to_numpy(dtype=float)
+    else:
+        X_values = np.asarray(X, dtype=float)
+
+    if X_values.ndim != 2:
+        raise ValueError("X debe tener forma (n_filas, n_features).")
+
+    n_samples = X_values.shape[0]
+    if row_labels is None:
+        row_labels = list(range(n_samples))
+    else:
+        row_labels = list(row_labels)
+
+    if len(row_labels) != n_samples:
+        raise ValueError("row_labels debe tener una etiqueta por fila de X.")
+
+    matrix = np.zeros((n_samples, n_samples), dtype=float)
+    run_rows = []
+
+    if ejecutar_diagonal:
+        total_circuits = n_samples * (n_samples + 1) // 2
+    else:
+        np.fill_diagonal(matrix, 1.0)
+        total_circuits = n_samples * (n_samples - 1) // 2
+
+    with tqdm(
+        total=total_circuits,
+        desc="Matriz kernel con Guppy",
+        unit="circuito",
+    ) as progress:
+        for i in range(n_samples):
+            start_j = i if ejecutar_diagonal else i + 1
+
+            for j in range(start_j, n_samples):
+                pair_seed = seed + i * n_samples + j
+                pair = ejecutar_kernel_guppy(
+                    X_values[i],
+                    X_values[j],
+                    n_shots=n_shots,
+                    seed=pair_seed,
+                    simulator=simulator,
+                )
+
+                value = pair["kernel"]
+                matrix[i, j] = value
+                matrix[j, i] = value
+
+                run_rows.append({
+                    "matrix_i": i,
+                    "matrix_j": j,
+                    "row_i": row_labels[i],
+                    "row_j": row_labels[j],
+                    "n_qubits": X_values.shape[1],
+                    "zero_state": pair["summary"]["zero_state"],
+                    "zero_count": pair["summary"]["zero_count"],
+                    "shots": pair["summary"]["shots"],
+                    "kernel_rate": value,
+                    "seed": pair_seed,
+                })
+
+                progress.set_postfix({
+                    "rows": f"{row_labels[i]},{row_labels[j]}",
+                    "Kij": f"{value:.4f}",
+                })
+                progress.update(1)
+
+    return {
+        "kernel_matrix": matrix,
+        "run_summary": pd.DataFrame(run_rows),
+        "row_labels": row_labels,
+        "n_circuits": total_circuits,
+        "n_shots_per_circuit": n_shots,
+    }
+
+
+def guardar_matriz_kernel_run(
+    matrix_result,
+    source="local_statevector",
+    run_id=None,
+    job_id=None,
+):
+    """
+    Guarda en CSV el resumen compacto de una construccion de matriz
+    kernel (una fila por circuito ejecutado).
+
+    Parameters
+    ----------
+    matrix_result : dict
+        Resultado devuelto por `construir_matriz_kernel_guppy` (o el
+        equivalente reconstruido desde un job remoto).
+    source : str, optional
+        Origen de la ejecucion. Por defecto "local_statevector".
+    run_id : optional
+        Identificador de la ejecucion; si no se pasa, se genera uno
+        local nuevo (``matrix-local-<uuid>``).
+    job_id : optional
+        Identificador del job de Nexus, si aplica.
+
+    Returns
+    -------
+    pathlib.Path
+        Ruta del CSV generado (``kernel_matrix_run_<run_id>.csv``).
+    """
+    if run_id is None:
+        run_id = f"matrix-local-{uuid.uuid4().hex[:12]}"
+
+    run_df = matrix_result["run_summary"].copy()
+    run_df.insert(0, "job_id", "" if job_id is None else str(job_id))
+    run_df.insert(0, "source", source)
+    run_df.insert(0, "run_id", str(run_id))
+
+    output_dir = Path("data/runs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_run_id = str(run_id).replace("/", "_").replace("\\", "_")
+    output_path = output_dir / f"kernel_matrix_run_{safe_run_id}.csv"
+    run_df.to_csv(output_path, index=False)
+    return output_path
