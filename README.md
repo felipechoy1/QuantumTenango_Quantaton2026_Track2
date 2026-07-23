@@ -62,6 +62,7 @@ Este archivo es un `venv` (entorno virtual de Python) comprimido, no un entorno 
 - 2026-07-22: se añadió `openpyxl`, requerido por `guardar_datasets_excel` para escribir archivos `.xlsx`.
 - 2026-07-22: `evaluar_forward` incorpora persistencia por hash (cache en disco) para evitar reentrenar si ya existe un resultado para la misma combinación de datos, modelo e hiperparámetros; imprime en consola si entrenó desde cero, cargó del cache, o reescribió el cache existente.
 - 2026-07-22: `graficar_matrices_confusion` colorea por conteo (no por porcentaje), con una barra de color independiente por cada matriz (train, test) para ver la proporcionalidad de cuadrantes dentro de cada una.
+- 2026-07-23: el cache de `evaluar_forward` pasa de pickle a JSON. Al instalar `guppylang`/`qnexus`/`pytket` en `qsvm`, `pandas` bajó de 3.0.3 a 2.3.3 como dependencia transitiva, y los `.pkl` guardados con la version anterior dejaron de poder leerse (`NotImplementedError` al deserializar `StringDtype`). JSON no depende de la representacion binaria interna de pandas/numpy, asi que es inmune a este tipo de incompatibilidad entre versiones. Se borraron los `.pkl` viejos de `cache/` (se regeneran solos al reentrenar).
 
 ## Nota: consulta de ejecuciones en Quantinuum Nexus
 

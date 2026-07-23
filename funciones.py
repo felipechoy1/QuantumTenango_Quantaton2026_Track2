@@ -243,6 +243,9 @@ def evaluar_forward(
     estimador (con sus hiperparametros) y el esquema de validacion
     cruzada, y se hashea (md5) para nombrar el archivo de cache. Si ya
     existe un resultado con ese hash, se reutiliza en vez de reentrenar.
+    El cache se guarda en JSON (no pickle), ya que el resultado es una
+    tabla simple (numeros y listas de nombres de columnas) y JSON no
+    depende de la version de pandas/numpy que lo genero.
 
     Parameters
     ----------
@@ -291,7 +294,7 @@ def evaluar_forward(
         os.makedirs(directorio_cache, exist_ok=True)
         ruta_cache = os.path.join(
             directorio_cache,
-            f"evaluar_forward_{hash_line}.pkl"
+            f"evaluar_forward_{hash_line}.json"
         )
 
         if forzar_reentrenamiento and os.path.exists(ruta_cache):
@@ -300,7 +303,7 @@ def evaluar_forward(
 
         elif not forzar_reentrenamiento and os.path.exists(ruta_cache):
             print(f"[evaluar_forward] Cache existente en '{ruta_cache}': se cargan los resultados guardados.")
-            return pd.read_pickle(ruta_cache)
+            return pd.read_json(ruta_cache, orient="records")
 
         else:
             print(f"[evaluar_forward] Sin cache previo en '{ruta_cache}': se entrena desde cero.")
@@ -356,7 +359,7 @@ def evaluar_forward(
     resultado_df = pd.DataFrame(resultados)
 
     if permitir_persistencia:
-        resultado_df.to_pickle(ruta_cache)
+        resultado_df.to_json(ruta_cache, orient="records", indent=2)
 
     return resultado_df
 
@@ -630,3 +633,137 @@ def guardar_datasets_excel(
         tabla_normalizados.to_excel(writer, sheet_name="normalizados", index=False)
 
     return ruta_excel
+
+
+def guardar_muestreo_excel(tabla_muestreo, ruta_excel, sheet_name="muestreos"):
+    """
+    Agrega (o reemplaza) la hoja `sheet_name` en un archivo Excel ya
+    existente, con la tabla de muestreo jerarquico balanceado.
+
+    Requiere que `ruta_excel` ya exista (por ejemplo, generado antes por
+    `guardar_datasets_excel`); esta funcion solo agrega/reemplaza una hoja,
+    no crea el archivo desde cero.
+
+    Parameters
+    ----------
+    tabla_muestreo : pandas.DataFrame
+        Tabla con la columna "_Muestreo_" (por ejemplo, el resultado de
+        `asignar_muestreo_balanceado`).
+    ruta_excel : str
+        Ruta del archivo `.xlsx` ya existente.
+    sheet_name : str, optional
+        Nombre de la hoja a agregar/reemplazar. Por defecto "muestreos".
+
+    Returns
+    -------
+    str
+        La ruta del archivo Excel.
+    """
+    with pd.ExcelWriter(
+        ruta_excel, engine="openpyxl", mode="a", if_sheet_exists="replace"
+    ) as writer:
+        tabla_muestreo.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    return ruta_excel
+
+
+def asignar_muestreo_balanceado(
+    df,
+    tamanos_por_particion,
+    objetivo="Potability",
+    particion="_PartInd_",
+    columna="_Muestreo_",
+    random_state=42,
+):
+    """
+    Agrega una columna de muestreo jerarquico balanceado por particion.
+
+    Para cada valor de `particion` se dibuja una secuencia de muestras
+    **anidadas** y **balanceadas** (mismo numero de filas por clase de
+    `objetivo`, es decir 50/50 en un objetivo binario; balanceado, no
+    estratificado). La muestra mas grande marca `columna` = 1; de ella se
+    extrae una submuestra que sobrescribe la marca a 2; de esa, otra que la
+    sobrescribe a 3; y asi para cada tamano. Las filas de la particion que
+    no entran en la muestra mas grande quedan en 0.
+
+    Como cada nivel sobrescribe al anterior, el valor final de `columna`
+    indica el nivel mas profundo que alcanzo cada fila. Esto permite
+    reconstruir cada muestra: las filas de la muestra de nivel k son las que
+    tienen `columna` >= k (por el anidamiento).
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Datos con las columnas `objetivo` y `particion`.
+    tamanos_por_particion : dict
+        Mapea cada valor de `particion` a una lista de tamanos totales de
+        muestra, de mayor a menor y anidados (por ejemplo
+        ``{0: [64, 32, 16], 1: [32, 16, 8]}``). Cada tamano debe ser
+        divisible entre el numero de clases y estrictamente menor que el
+        anterior.
+    objetivo : str, optional
+        Columna objetivo sobre la que se balancea. Por defecto "Potability".
+    particion : str, optional
+        Columna que define las particiones. Por defecto "_PartInd_".
+    columna : str, optional
+        Nombre de la columna de muestreo a crear. Por defecto "_Muestreo_".
+    random_state : int, optional
+        Semilla para reproducibilidad. Por defecto 42.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Copia de `df` con la columna `columna` agregada (enteros; 0 para las
+        filas fuera de la muestra).
+
+    Raises
+    ------
+    ValueError
+        Si algun tamano no es divisible entre el numero de clases, los
+        tamanos no van en orden estrictamente decreciente, o no hay
+        suficientes filas de alguna clase para una muestra balanceada.
+    """
+    resultado = df.copy()
+    resultado[columna] = 0
+    rng = np.random.RandomState(random_state)
+
+    for valor_particion, tamanos in tamanos_por_particion.items():
+        tamanos = list(tamanos)
+        filas_particion = resultado.loc[resultado[particion] == valor_particion]
+        clases = sorted(filas_particion[objetivo].unique())
+        n_clases = len(clases)
+
+        for tamano in tamanos:
+            if tamano % n_clases != 0:
+                raise ValueError(
+                    f"Particion {valor_particion}: el tamano {tamano} no es divisible "
+                    f"entre {n_clases} clases; no se puede balancear."
+                )
+        for anterior, siguiente in zip(tamanos, tamanos[1:]):
+            if siguiente >= anterior:
+                raise ValueError(
+                    f"Particion {valor_particion}: los tamanos deben ir en orden "
+                    f"estrictamente decreciente (muestras anidadas); recibido {tamanos}."
+                )
+
+        idx_nivel_previo = None
+        for nivel, tamano in enumerate(tamanos, start=1):
+            por_clase = tamano // n_clases
+            pool = filas_particion if nivel == 1 else resultado.loc[idx_nivel_previo]
+
+            partes = []
+            for clase in clases:
+                grupo = pool[pool[objetivo] == clase]
+                if len(grupo) < por_clase:
+                    raise ValueError(
+                        f"Particion {valor_particion}, clase {clase}: hay {len(grupo)} "
+                        f"filas disponibles en el nivel {nivel}, se necesitan {por_clase} "
+                        f"para una muestra balanceada de {tamano}."
+                    )
+                partes.append(grupo.sample(n=por_clase, random_state=rng))
+
+            idx_nivel = pd.concat(partes).index
+            resultado.loc[idx_nivel, columna] = nivel
+            idx_nivel_previo = idx_nivel
+
+    return resultado
