@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from sklearn import __version__ as sklearn_version
 from sklearn.base import clone
 from sklearn.feature_selection import SequentialFeatureSelector
 from sklearn.metrics import (
@@ -31,6 +32,22 @@ from pytket import Circuit
 from pytket.passes import RemoveBarriers
 from pytket.circuit.display import get_circuit_renderer
 from IPython.display import HTML, display
+
+
+def _fingerprint_datos(X, y):
+    """Devuelve una huella estable del contenido, esquema y orden de X/y."""
+    X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(np.asarray(X))
+    y_serie = y if isinstance(y, pd.Series) else pd.Series(np.asarray(y))
+
+    digest = hashlib.sha256()
+    digest.update(b"qsvm-cache-v2")
+    digest.update(repr(list(X_df.columns)).encode("utf-8"))
+    digest.update(repr([str(dtype) for dtype in X_df.dtypes]).encode("utf-8"))
+    digest.update(pd.util.hash_pandas_object(X_df, index=True).values.tobytes())
+    digest.update(str(y_serie.name).encode("utf-8"))
+    digest.update(str(y_serie.dtype).encode("utf-8"))
+    digest.update(pd.util.hash_pandas_object(y_serie, index=True).values.tobytes())
+    return digest.hexdigest()
 
 
 def graficar_box_hist_grid(df, features, variables_por_fila=2, num_bins=10):
@@ -242,7 +259,8 @@ def evaluar_forward(
     forzar_reentrenamiento=False,
     directorio_cache="cache",
     param_grid=None,
-    metrica_refit="f1"
+    metrica_refit="f1",
+    n_jobs=-1,
 ):
     """
     Evalua un modelo mediante forward selection incremental, calculando
@@ -337,16 +355,17 @@ def evaluar_forward(
 
     if permitir_persistencia:
         line = "|".join([
-            str(sorted(X.columns.tolist())),
-            str(X.shape),
-            str(getattr(y, "name", "y")),
+            _fingerprint_datos(X, y),
+            str(X.columns.tolist()),
             repr(modelo.get_params()),
             repr(cv),
             repr(param_grid),
-            metrica_refit if param_grid is not None else ""
+            metrica_refit if param_grid is not None else "",
+            str(n_jobs),
+            sklearn_version,
         ])
 
-        hash_line = hashlib.md5(line.encode("utf-8")).hexdigest()
+        hash_line = hashlib.sha256(line.encode("utf-8")).hexdigest()
 
         os.makedirs(directorio_cache, exist_ok=True)
         ruta_cache = os.path.join(
@@ -379,7 +398,7 @@ def evaluar_forward(
                 direction="forward",
                 scoring="f1",
                 cv=cv,
-                n_jobs=-1
+                n_jobs=n_jobs
             )
 
             selector.fit(X, y)
@@ -405,7 +424,7 @@ def evaluar_forward(
                     "auc": "roc_auc",
                     "recall":"recall"
                 },
-                n_jobs=-1
+                n_jobs=n_jobs
             )
             fila["f1_cv"] = metricas_cv["test_f1"].mean()
             fila["auc_cv"] = metricas_cv["test_auc"].mean()
@@ -423,7 +442,7 @@ def evaluar_forward(
                 },
                 refit=metrica_refit,
                 cv=cv,
-                n_jobs=-1
+                n_jobs=n_jobs
             )
             grid.fit(X[variables], y)
 
@@ -705,7 +724,9 @@ def guardar_datasets_excel(
         agregar_indicadores(X_test, y_test, 1),
     ], ignore_index=True)
 
-    os.makedirs(os.path.dirname(ruta_excel), exist_ok=True)
+    directorio = os.path.dirname(ruta_excel)
+    if directorio:
+        os.makedirs(directorio, exist_ok=True)
 
     with pd.ExcelWriter(ruta_excel, engine="openpyxl") as writer:
         tabla_originales.to_excel(writer, sheet_name="originales", index=False)
@@ -820,6 +841,13 @@ def asignar_muestreo_balanceado(
     resultado[columna] = 0
     rng = np.random.RandomState(random_state)
 
+    columnas_requeridas = {objetivo, particion}
+    faltantes = columnas_requeridas.difference(resultado.columns)
+    if faltantes:
+        raise ValueError(
+            f"Faltan columnas requeridas en df: {sorted(faltantes)}."
+        )
+
     if columna_imputacion is not None and columna_imputacion not in resultado.columns:
         raise ValueError(
             f"La columna '{columna_imputacion}' no existe en df; se necesita para "
@@ -836,6 +864,11 @@ def asignar_muestreo_balanceado(
             ]
         clases = sorted(filas_particion[objetivo].unique())
         n_clases = len(clases)
+        if n_clases < 2:
+            raise ValueError(
+                f"Particion {valor_particion}: se necesitan al menos dos clases "
+                f"para construir una muestra balanceada; encontradas {clases}."
+            )
 
         for tamano in tamanos:
             if tamano % n_clases != 0:
@@ -1304,6 +1337,7 @@ def evaluar_grid_search(
     permitir_persistencia=True,
     forzar_reentrenamiento=False,
     directorio_cache="cache",
+    n_jobs=-1,
 ):
     """Ejecuta (o recupera de cache) un GridSearchCV sobre variables fijas.
 
@@ -1359,17 +1393,18 @@ def evaluar_grid_search(
 
     if permitir_persistencia:
         line = "|".join([
-            str(sorted(X.columns.tolist())),
-            str(X.shape),
-            str(getattr(y, "name", "y")),
+            _fingerprint_datos(X, y),
+            str(X.columns.tolist()),
             repr(modelo.get_params()),
             repr(param_grid),
             repr(cv),
             repr(scoring),
             refit,
+            str(n_jobs),
+            sklearn_version,
         ])
 
-        hash_line = hashlib.md5(line.encode("utf-8")).hexdigest()
+        hash_line = hashlib.sha256(line.encode("utf-8")).hexdigest()
 
         os.makedirs(directorio_cache, exist_ok=True)
         ruta_cache = os.path.join(
@@ -1404,7 +1439,7 @@ def evaluar_grid_search(
         scoring=scoring,
         refit=refit,
         cv=cv,
-        n_jobs=-1,
+        n_jobs=n_jobs,
         return_train_score=True,
     )
     grid.fit(X, y)
@@ -2905,12 +2940,30 @@ def _cargar_kernels(familias, destino, cual):
         if not ruta:
             filas.append({
                 "familia": clave, "estado": "pendiente", col_n: "",
-                col_ruta: "", "detalle": f"sin ruta_{cual}; usar calcular_ktrain",
+                col_ruta: "", "detalle": f"sin ruta_{cual}; usar calcular_k{cual}",
             })
             continue
 
         try:
             K = cargar_kernel_qsvm(ruta)
+            valores = K.to_numpy(dtype=float)
+            if not np.isfinite(valores).all():
+                raise ValueError("la matriz contiene NaN o infinitos")
+            if valores.min() < -1e-12 or valores.max() > 1 + 1e-12:
+                raise ValueError("la matriz contiene valores fuera del rango [0, 1]")
+            if cual == "train":
+                if K.shape != (tamano, tamano):
+                    raise ValueError(
+                        f"forma {K.shape}; se esperaba ({tamano}, {tamano})"
+                    )
+                if not np.allclose(valores, valores.T, atol=1e-12, rtol=0):
+                    raise ValueError("K_train no es simetrica")
+                if not np.allclose(np.diag(valores), 1.0, atol=1e-12, rtol=0):
+                    raise ValueError("la diagonal de K_train no es unitaria")
+            elif K.shape[1] != tamano:
+                raise ValueError(
+                    f"forma {K.shape}; K_test debe tener {tamano} columnas"
+                )
             destino[clave] = K
             filas.append({
                 "familia": clave, "estado": "cargada", col_n: K.shape[0],
@@ -3323,7 +3376,15 @@ def etiquetas_familia(muestreo_df, tamano, nivel_por_tamano, objetivo="Potabilit
     return y_train, y_test
 
 
-def evaluar_familia_qsvm(K_train, y_train, K_test, y_test, param_grid=None, random_state=42):
+def evaluar_familia_qsvm(
+    K_train,
+    y_train,
+    K_test,
+    y_test,
+    param_grid=None,
+    random_state=42,
+    n_jobs=-1,
+):
     """Entrena un SVM de kernel precomputado con busqueda de C y evalua train/test.
 
     Ajusta ``SVC(kernel="precomputed", class_weight="balanced")`` buscando el
@@ -3358,9 +3419,32 @@ def evaluar_familia_qsvm(K_train, y_train, K_test, y_test, param_grid=None, rand
 
     K_train = np.asarray(K_train, dtype=float)
     K_test = np.asarray(K_test, dtype=float)
+    y_train = np.asarray(y_train)
+    y_test = np.asarray(y_test)
 
-    qsvm = SVC(kernel="precomputed", class_weight="balanced",
-               probability=True, random_state=random_state)
+    if K_train.ndim != 2 or K_train.shape[0] != K_train.shape[1]:
+        raise ValueError(f"K_train debe ser cuadrada; forma recibida {K_train.shape}.")
+    if K_test.ndim != 2 or K_test.shape[1] != K_train.shape[0]:
+        raise ValueError(
+            "K_test debe tener una columna por fila de K_train; "
+            f"formas recibidas K_train={K_train.shape}, K_test={K_test.shape}."
+        )
+    if len(y_train) != K_train.shape[0] or len(y_test) != K_test.shape[0]:
+        raise ValueError(
+            "Las etiquetas no coinciden con las matrices: "
+            f"len(y_train)={len(y_train)}, len(y_test)={len(y_test)}, "
+            f"K_train={K_train.shape}, K_test={K_test.shape}."
+        )
+    if not np.isfinite(K_train).all() or not np.isfinite(K_test).all():
+        raise ValueError("Las matrices kernel contienen NaN o infinitos.")
+    if not np.allclose(K_train, K_train.T, atol=1e-12, rtol=0):
+        raise ValueError("K_train debe ser simetrica.")
+    if K_train.min() < -1e-12 or K_test.min() < -1e-12:
+        raise ValueError("Las matrices kernel contienen valores menores que 0.")
+    if K_train.max() > 1 + 1e-12 or K_test.max() > 1 + 1e-12:
+        raise ValueError("Las matrices kernel contienen valores mayores que 1.")
+
+    qsvm = SVC(kernel="precomputed", class_weight="balanced")
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
 
     grid = GridSearchCV(
@@ -3368,7 +3452,7 @@ def evaluar_familia_qsvm(K_train, y_train, K_test, y_test, param_grid=None, rand
         scoring={"accuracy": "accuracy", "precision": "precision",
                  "recall": "recall", "balanced_accuracy": "balanced_accuracy",
                  "f1": "f1"},
-        refit="f1", cv=cv, n_jobs=-1, return_train_score=True,
+        refit="f1", cv=cv, n_jobs=n_jobs, return_train_score=True,
     )
     grid.fit(K_train, y_train)
     modelo = grid.best_estimator_
@@ -3493,8 +3577,7 @@ def entrenar_svm_muestra(
     X_test = muestreo_df.loc[test_mask, variables].reset_index(drop=True)
     y_test = muestreo_df.loc[test_mask, objetivo].reset_index(drop=True).astype(int)
 
-    modelo = SVC(kernel="rbf", class_weight="balanced", probability=True,
-                 random_state=random_state)
+    modelo = SVC(kernel="rbf", class_weight="balanced")
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
     scoring = {"accuracy": "accuracy", "precision": "precision", "recall": "recall",
                "balanced_accuracy": "balanced_accuracy", "f1": "f1"}
