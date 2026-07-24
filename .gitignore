@@ -1,8 +1,11 @@
-# Heavy/binary files - do not commit
-*.rar
-*.zip
-*.7z
-venv_qsvm.rar
+# Version anterior del proyecto: archivos viejos movidos aqui durante la
+# migracion a la version limpia. Se conservan en disco pero sin seguimiento.
+anterior/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
 
 # Python virtual environments
 venv/
@@ -10,25 +13,13 @@ venv/
 env/
 ENV/
 
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
-
 # Jupyter
 .ipynb_checkpoints/
 
-# Cache de resultados persistidos (evaluar_forward, etc.)
-cache/
-
-# Entrega original del kernel ZZ: ya homologada en funciones_nexus.py y
-# guppy_kernel_qsvm.ipynb. Se conserva local como referencia, sin
-# seguimiento; el baseline congelado vive en el historial (commit cbb2caf).
-guppy_kernel_handoff/
-
-# Carpeta de migracion de otro programador (kernel para dataset de test).
-# Referencia local para homologar; sin seguimiento en el repo.
-guppy_kernel_test/
+# Archivos pesados/binarios
+*.rar
+*.zip
+*.7z
 
 # OS files
 .DS_Store
