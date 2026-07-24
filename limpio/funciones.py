@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 
 import matplotlib.pyplot as plt
@@ -16,6 +17,10 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GridSearchCV, cross_validate
 from tqdm.auto import tqdm
+
+from pytket import Circuit
+from pytket.circuit.display import get_circuit_renderer
+from IPython.display import HTML, display
 
 
 def graficar_box_hist_grid(df, features, variables_por_fila=2, num_bins=10):
@@ -856,3 +861,554 @@ def asignar_muestreo_balanceado(
             idx_nivel_previo = idx_nivel
 
     return resultado
+
+
+def zz_feature_map(x):
+    """
+    Construye el feature map ZZ ``U(x)`` enteramente en pytket.
+
+    Aplica una capa de Hadamard, rotaciones Rz individuales proporcionales
+    a cada feature y correlaciones ZZ (CX-Rz-CX) entre cada par de qubits.
+    pytket expresa los angulos en medias vueltas, por eso cada angulo se
+    divide entre pi.
+
+    Parameters
+    ----------
+    x : array-like
+        Vector de features escaladas de una observacion; cada feature se
+        codifica en un qubit.
+
+    Returns
+    -------
+    pytket.Circuit
+        Circuito U(x) con barreras entre bloques (utiles para inspeccion
+        visual; se eliminan antes de ejecutar).
+    """
+    x = np.asarray(x, dtype=float)
+    n_qubits = len(x)
+
+    circuit = Circuit(n_qubits, name="ZZ Feature Map")
+    qubits = list(range(n_qubits))
+
+    # Embedding individual
+    for i in range(n_qubits):
+        circuit.H(i)
+
+    # pytket expresa los angulos en medias vueltas.
+    for i in range(n_qubits):
+        circuit.Rz(2 * x[i] / np.pi, i)
+
+    circuit.add_barrier(qubits)
+
+    # Correlaciones ZZ
+    for i in range(n_qubits):
+        for j in range(i + 1, n_qubits):
+            angle = 2 * (np.pi - x[i]) * (np.pi - x[j])
+            circuit.CX(i, j)
+            circuit.Rz(angle / np.pi, j)
+            circuit.CX(i, j)
+            circuit.add_barrier(qubits)
+
+    return circuit
+
+
+def agregar_exp_yy(circuit, left, right, parameter):
+    """
+    Aplica ``exp(-i * phi * Y_left Y_right)`` con compuertas elementales.
+
+    Cambia de la base Y a la base Z (``Sdg`` + ``H``), aplica la fase
+    conjunta como una interaccion ZZ por paridad (``CX-Rz-CX``) y regresa
+    a la base Y (``H`` + ``S``). No usa PauliExpBox, por lo que el circuito
+    queda inspeccionable puerta por puerta.
+
+    Parameters
+    ----------
+    circuit : pytket.Circuit
+        Circuito sobre el que se agregan las compuertas (in place).
+    left, right : int
+        Qubits sobre los que actua la interaccion YY.
+    parameter : float
+        Angulo de la rotacion Rz central, ya expresado en medias vueltas
+        (``2 * phi / pi``).
+    """
+    # Cambio de base Y -> Z
+    circuit.Sdg(left)
+    circuit.Sdg(right)
+    circuit.H(left)
+    circuit.H(right)
+
+    # Exponencial ZZ mediante paridad
+    circuit.CX(left, right)
+    circuit.Rz(parameter, right)
+    circuit.CX(left, right)
+
+    # Regreso de base Z -> Y
+    circuit.H(left)
+    circuit.H(right)
+    circuit.S(left)
+    circuit.S(right)
+
+
+def pauli_feature_map_zyy(x):
+    """
+    Construye el feature map Pauli ``Z + YY`` (entrelazamiento lineal).
+
+    Aplica una capa de Hadamard, rotaciones Rz individuales (terminos Z,
+    ``phi_i(x) = x_i``) y correlaciones YY entre qubits vecinos
+    (``phi_ij(x) = (pi - x_i)(pi - x_j)``) expandidas con compuertas
+    elementales via `agregar_exp_yy` (sin PauliExpBox). pytket expresa los
+    angulos en medias vueltas, por eso cada angulo se divide entre pi.
+
+    Parameters
+    ----------
+    x : array-like
+        Vector de features escaladas de una observacion; cada feature se
+        codifica en un qubit.
+
+    Returns
+    -------
+    pytket.Circuit
+        Circuito U(x) con barreras entre bloques (utiles para inspeccion
+        visual; se eliminan antes de ejecutar).
+    """
+    x = np.asarray(x, dtype=float)
+    n_qubits = len(x)
+
+    circuit = Circuit(n_qubits, name="Pauli Z+YY lineal")
+    qubits = list(range(n_qubits))
+
+    # Superposicion inicial
+    for i in range(n_qubits):
+        circuit.H(i)
+
+    # Terminos individuales Z; pytket usa medias vueltas.
+    for i in range(n_qubits):
+        circuit.Rz(2 * x[i] / np.pi, i)
+
+    circuit.add_barrier(qubits)
+
+    # Interacciones YY entre qubits vecinos (entrelazamiento lineal)
+    for left in range(n_qubits - 1):
+        right = left + 1
+        phi = (np.pi - x[left]) * (np.pi - x[right])
+        agregar_exp_yy(circuit, left, right, 2 * phi / np.pi)
+        circuit.add_barrier(qubits)
+
+    return circuit
+
+
+def feature_map_ry_cx_rx(x):
+    """
+    Construye el feature map personalizado ``Ry -> cadena CX -> Rx``.
+
+    Cada qubit recibe ``Ry(x_i)``, luego se aplica la cadena lineal de
+    ``CX`` (0->1, 1->2, ...) y finalmente cada qubit recibe ``Rx(x_i)``.
+    pytket expresa las rotaciones en medias vueltas, por eso el angulo
+    fisico ``x_i`` se escribe como ``x_i / pi``.
+
+    Parameters
+    ----------
+    x : array-like
+        Vector de features escaladas de una observacion; cada feature se
+        codifica en un qubit.
+
+    Returns
+    -------
+    pytket.Circuit
+        Circuito U(x) con barreras entre bloques (utiles para inspeccion
+        visual; se eliminan antes de ejecutar).
+    """
+    x = np.asarray(x, dtype=float)
+    n_qubits = len(x)
+
+    circuit = Circuit(n_qubits, name="RY-CX-RX lineal")
+    qubits = list(range(n_qubits))
+
+    # Rotaciones Ry individuales
+    for i in range(n_qubits):
+        circuit.Ry(x[i] / np.pi, i)
+
+    circuit.add_barrier(qubits)
+
+    # Cadena lineal de CX
+    for control in range(n_qubits - 1):
+        circuit.CX(control, control + 1)
+
+    circuit.add_barrier(qubits)
+
+    # Rotaciones Rx individuales
+    for i in range(n_qubits):
+        circuit.Rx(x[i] / np.pi, i)
+
+    return circuit
+
+
+# Registro de feature maps disponibles para el kernel. La clave es el
+# identificador que se pasa como parametro `feature_map`; el valor es el
+# constructor U(x) en pytket. Todos comparten la misma tuberia (mismo
+# `kernel_circuit`, mismo programa guppy, misma extraccion de P(00...0)).
+FEATURE_MAPS = {
+    "zz": zz_feature_map,
+    "zyy": pauli_feature_map_zyy,
+    "ry_cx_rx": feature_map_ry_cx_rx,
+}
+
+
+def obtener_feature_map(feature_map):
+    """
+    Resuelve el parametro `feature_map` a su constructor U(x).
+
+    Parameters
+    ----------
+    feature_map : str or callable
+        Clave de `FEATURE_MAPS` ("zz", "zyy" o "ry_cx_rx") o directamente
+        una funcion ``f(x) -> pytket.Circuit``.
+
+    Returns
+    -------
+    callable
+        La funcion constructora del feature map.
+
+    Raises
+    ------
+    ValueError
+        Si `feature_map` es una cadena que no esta en `FEATURE_MAPS`.
+    """
+    if callable(feature_map):
+        return feature_map
+    try:
+        return FEATURE_MAPS[feature_map]
+    except KeyError:
+        opciones = ", ".join(sorted(FEATURE_MAPS))
+        raise ValueError(
+            f"feature_map '{feature_map}' no reconocido. "
+            f"Opciones: {opciones}."
+        )
+
+
+def parsear_familia(familia):
+    """Descompone una entrada de FAMILIAS en (feature_map, tamano, ruta_train, ruta_test).
+
+    Cada entrada es (feature_map, tamano) o
+    (feature_map, tamano, ruta_train, ruta_test). ruta_train/ruta_test son
+    las rutas (str) a los csv con las matrices K_train/K_test ya
+    calculadas en una ejecucion anterior; usa "" para la que todavia no
+    exista. Formatos validos: 2 elementos, o 4 elementos con el 3ro y/o
+    4to en blanco ("").
+
+    - Si ambas rutas estan presentes, la familia ya esta completa: no se
+      calcula nada (idempotencia).
+    - Si falta una, solo esa matriz se debe calcular; la otra se reutiliza
+      desde su ruta.
+    - Si no hay 3er/4to elemento, ambas quedan pendientes de calcular.
+
+    Devuelve None (no "") para la ruta que falte, para simplificar los
+    chequeos posteriores (``if ruta_train:``).
+
+    Parameters
+    ----------
+    familia : tuple
+        Entrada de FAMILIAS, con 2 o 4 elementos.
+
+    Returns
+    -------
+    tuple
+        (feature_map, tamano, ruta_train, ruta_test).
+
+    Raises
+    ------
+    ValueError
+        Si `familia` no tiene 2 ni 4 elementos, o si ruta_train/ruta_test
+        no son strings.
+    """
+    if len(familia) == 2:
+        feature_map, tamano = familia
+        return feature_map, tamano, None, None
+    if len(familia) == 4:
+        feature_map, tamano, ruta_train, ruta_test = familia
+        for nombre_campo, ruta in (("ruta_train", ruta_train), ("ruta_test", ruta_test)):
+            if not isinstance(ruta, str):
+                raise ValueError(
+                    f'{nombre_campo} de {familia!r} debe ser un string (usa "" si no '
+                    f'aplica); recibido {ruta!r}.'
+                )
+        return feature_map, tamano, (ruta_train or None), (ruta_test or None)
+    raise ValueError(
+        f"Cada entrada de FAMILIAS debe tener 2 o 4 elementos "
+        f"(feature_map, tamano) o (feature_map, tamano, ruta_train, ruta_test); "
+        f"recibido {familia!r} con {len(familia)} elementos."
+    )
+
+
+def nivel_muestreo(tamano, nivel_por_tamano):
+    """Resuelve el nivel de `_Muestreo_` correspondiente a un tamano de train.
+
+    Parameters
+    ----------
+    tamano : int
+        Tamano de train de la familia (por ejemplo 16 o 32).
+    nivel_por_tamano : dict
+        Mapeo tamano -> nivel de muestreo (columna `_Muestreo_`).
+
+    Returns
+    -------
+    int
+        Nivel de muestreo correspondiente.
+
+    Raises
+    ------
+    ValueError
+        Si `tamano` no esta en `nivel_por_tamano`.
+    """
+    if tamano not in nivel_por_tamano:
+        raise ValueError(
+            f"Tamano {tamano} sin nivel de muestreo definido; agrega la entrada "
+            f"correspondiente en nivel_por_tamano."
+        )
+    return nivel_por_tamano[tamano]
+
+
+def contar_registros_familia(tamano, nivel_por_tamano, muestreo_df):
+    """Cuenta filas de train/test disponibles para el nivel de muestreo de `tamano`.
+
+    Parameters
+    ----------
+    tamano : int
+        Tamano de train de la familia.
+    nivel_por_tamano : dict
+        Mapeo tamano -> nivel de muestreo, usado por `nivel_muestreo`.
+    muestreo_df : pandas.DataFrame
+        Hoja `muestreos` de `dataset_v1.xlsx`, con las columnas
+        `_PartInd_` y `_Muestreo_`.
+
+    Returns
+    -------
+    tuple of int
+        (n_train, n_test).
+    """
+    nivel = nivel_muestreo(tamano, nivel_por_tamano)
+    n_train = ((muestreo_df["_PartInd_"] == 0) & (muestreo_df["_Muestreo_"] >= nivel)).sum()
+    n_test = ((muestreo_df["_PartInd_"] == 1) & (muestreo_df["_Muestreo_"] >= nivel)).sum()
+    return int(n_train), int(n_test)
+
+
+def construir_circuitos_ejemplo(x_ejemplo, n_qubits):
+    """Construye U(x) y U(x) dagger de ejemplo para cada feature map registrado.
+
+    Un circuito de ejemplo por feature map basta para inspeccion visual:
+    el tamano de muestra (16 vs 32) no cambia el circuito, solo cuantos
+    pares se corren despues.
+
+    Parameters
+    ----------
+    x_ejemplo : array-like
+        Vector de features de una observacion (misma fila para los 3
+        feature maps).
+    n_qubits : int
+        Numero de qubits esperado (variables seleccionadas en el Paso 1).
+
+    Returns
+    -------
+    tuple of dict
+        (circuitos_u, circuitos_u_dagger), cada uno mapeando el nombre del
+        feature map a su `pytket.Circuit`.
+
+    Raises
+    ------
+    AssertionError
+        Si algun feature map no genera un circuito con `n_qubits` qubits.
+    """
+    circuitos_u = {}
+    circuitos_u_dagger = {}
+    for nombre_fm, constructor in FEATURE_MAPS.items():
+        circuito_u = constructor(x_ejemplo)
+        assert circuito_u.n_qubits == n_qubits, (
+            f"El feature map '{nombre_fm}' no coincide con n_qubits={n_qubits}."
+        )
+        circuito_u.name = f"{nombre_fm} - U(x)"
+
+        circuito_u_dagger = circuito_u.dagger()
+        circuito_u_dagger.name = f"{nombre_fm} - U(x) dagger"
+
+        circuitos_u[nombre_fm] = circuito_u
+        circuitos_u_dagger[nombre_fm] = circuito_u_dagger
+    return circuitos_u, circuitos_u_dagger
+
+
+def mostrar_inspeccion_feature_map(
+    circuitos_u,
+    circuitos_u_dagger,
+    alto_cabecera=150,
+    alto_por_qubit=72,
+):
+    """Renderiza los circuitos U(x)/U(x) dagger de cada familia, apilados.
+
+    Muestra los 6 circuitos (U y U dagger de cada feature map) uno debajo
+    del otro, cada uno precedido de un titulo que lo identifica. Cada
+    circuito se renderiza por separado (una llamada al renderer por
+    circuito), no como una lista con ``orient="column"``: el render de
+    pytket mete la lista en un solo iframe de altura fija y los circuitos
+    se recortan y traslapan. Renderizando de a uno, cada circuito recibe
+    su propia ventana navegable (zoom/scroll propios del render) con la
+    altura ajustada a su numero de qubits.
+
+    Parameters
+    ----------
+    circuitos_u : dict
+        Nombre de feature map -> `pytket.Circuit` de U(x), tal como los
+        devuelve `construir_circuitos_ejemplo`.
+    circuitos_u_dagger : dict
+        Nombre de feature map -> `pytket.Circuit` de U(x) dagger.
+    alto_cabecera : int, optional
+        Pixeles reservados para la barra de controles del render (parte
+        que no depende del numero de qubits). Por defecto 150.
+    alto_por_qubit : int, optional
+        Pixeles que ocupa cada fila de qubit en el render. Por defecto 72.
+        Junto con `alto_cabecera` fija la altura de la ventana de cada
+        circuito para que se vea completo sin recortes ni exceso de
+        espacio en blanco.
+    """
+    renderer = get_circuit_renderer()
+
+    def _render_circuito(titulo, circuito):
+        display(HTML(
+            "<div style='font-weight:600;font-size:14px;margin:16px 0 4px;"
+            f"font-family:sans-serif'>{titulo}</div>"
+        ))
+        renderer.config.min_height = f"{alto_cabecera + circuito.n_qubits * alto_por_qubit}px"
+        renderer.render_circuit_jupyter(circuito)
+
+    for nombre_fm in circuitos_u:
+        _render_circuito(f"{nombre_fm} · U(x)", circuitos_u[nombre_fm])
+        _render_circuito(f"{nombre_fm} · U(x)†", circuitos_u_dagger[nombre_fm])
+
+
+def evaluar_grid_search(
+    X,
+    y,
+    modelo,
+    param_grid,
+    cv,
+    scoring,
+    refit,
+    permitir_persistencia=True,
+    forzar_reentrenamiento=False,
+    directorio_cache="cache",
+):
+    """Ejecuta (o recupera de cache) un GridSearchCV sobre variables fijas.
+
+    Igual que `evaluar_forward`, la busqueda es costosa pero siempre da el
+    mismo resultado para los mismos datos/modelo/grid, asi que se memoriza
+    en disco: se arma una huella con las columnas de X, su forma, el
+    estimador base (con sus hiperparametros), param_grid, cv, scoring y
+    refit, y se hashea (md5) para nombrar el archivo de cache. Si ya existe
+    un resultado con ese hash, se reutiliza en vez de repetir la busqueda.
+
+    El cache solo guarda `cv_results_` y los mejores hiperparametros (JSON,
+    no pickle, por la misma razon que en `evaluar_forward`); el estimador
+    final SI se reentrena siempre con esos hiperparametros ganadores (un
+    solo fit, barato) porque un modelo de sklearn no se guarda en JSON.
+
+    Parameters
+    ----------
+    X : pandas.DataFrame
+        Variables predictoras (ya seleccionadas).
+    y : pandas.Series or array-like
+        Variable objetivo.
+    modelo : sklearn estimator
+        Estimador base a clonar (sus hiperparametros fijos son el punto de
+        partida; `param_grid` sobreescribe los que este buscando).
+    param_grid : dict
+        Grid de hiperparametros de `GridSearchCV`.
+    cv : int, cross-validation generator or iterable
+        Estrategia de validacion cruzada.
+    scoring : dict
+        Metricas de `GridSearchCV` (formato `scikit-learn`).
+    refit : str
+        Metrica de `scoring` usada para elegir los mejores hiperparametros.
+    permitir_persistencia : bool, optional
+        Si es True (por defecto), el resultado se guarda en
+        `directorio_cache` y se reutiliza si ya existe uno para la misma
+        combinacion de X, modelo, param_grid, cv, scoring y refit.
+    forzar_reentrenamiento : bool, optional
+        Si es True, se borra el hash existente (si lo hay) y se repite la
+        busqueda desde cero, sobrescribiendo el cache. Por defecto False.
+    directorio_cache : str, optional
+        Carpeta donde se guardan/leen los resultados persistidos. Por
+        defecto "cache".
+
+    Returns
+    -------
+    tuple
+        (cv_results_df, mejor_estimador, mejores_parametros):
+        `cv_results_df` es `pd.DataFrame(grid.cv_results_)` completo,
+        `mejor_estimador` ya esta reentrenado con `mejores_parametros`
+        sobre todo `X`/`y`.
+    """
+    ruta_cache = None
+
+    if permitir_persistencia:
+        line = "|".join([
+            str(sorted(X.columns.tolist())),
+            str(X.shape),
+            str(getattr(y, "name", "y")),
+            repr(modelo.get_params()),
+            repr(param_grid),
+            repr(cv),
+            repr(scoring),
+            refit,
+        ])
+
+        hash_line = hashlib.md5(line.encode("utf-8")).hexdigest()
+
+        os.makedirs(directorio_cache, exist_ok=True)
+        ruta_cache = os.path.join(
+            directorio_cache,
+            f"evaluar_grid_search_{hash_line}.json"
+        )
+
+        if forzar_reentrenamiento and os.path.exists(ruta_cache):
+            print(f"[evaluar_grid_search] Cache existente en '{ruta_cache}': se reescribira (forzar_reentrenamiento=True).")
+            os.remove(ruta_cache)
+
+        elif not forzar_reentrenamiento and os.path.exists(ruta_cache):
+            print(f"[evaluar_grid_search] Cache existente en '{ruta_cache}': se cargan los resultados guardados.")
+            with open(ruta_cache, "r", encoding="utf-8") as archivo_cache:
+                cache_payload = json.load(archivo_cache)
+
+            cv_results_df = pd.DataFrame(cache_payload["cv_results"])
+            mejores_parametros = cache_payload["mejores_parametros"]
+
+            mejor_estimador = clone(modelo)
+            mejor_estimador.set_params(**mejores_parametros)
+            mejor_estimador.fit(X, y)
+
+            return cv_results_df, mejor_estimador, mejores_parametros
+
+        else:
+            print(f"[evaluar_grid_search] Sin cache previo en '{ruta_cache}': se entrena desde cero.")
+
+    grid = GridSearchCV(
+        estimator=clone(modelo),
+        param_grid=param_grid,
+        scoring=scoring,
+        refit=refit,
+        cv=cv,
+        n_jobs=-1,
+        return_train_score=True,
+    )
+    grid.fit(X, y)
+
+    cv_results_df = pd.DataFrame(grid.cv_results_)
+    mejores_parametros = grid.best_params_
+    mejor_estimador = grid.best_estimator_
+
+    if permitir_persistencia:
+        cache_payload = {
+            "cv_results": json.loads(cv_results_df.to_json(orient="records")),
+            "mejores_parametros": mejores_parametros,
+        }
+        with open(ruta_cache, "w", encoding="utf-8") as archivo_cache:
+            json.dump(cache_payload, archivo_cache, indent=2)
+
+    return cv_results_df, mejor_estimador, mejores_parametros
