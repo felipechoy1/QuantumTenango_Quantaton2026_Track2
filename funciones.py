@@ -288,11 +288,12 @@ def evaluar_forward(
       todos los k con el mismo `modelo` fijo.
 
     Al ser un proceso costoso, el resultado se puede memorizar en disco:
-    se arma una "line" (huella) con las columnas de X, su forma, el
+    se arma una huella con el contenido, esquema y orden de X/y, el
     estimador (con sus hiperparametros), el esquema de validacion
-    cruzada y el grid de hiperparametros (si aplica), y se hashea (md5)
-    para nombrar el archivo de cache. Si ya existe un resultado con ese
-    hash, se reutiliza en vez de reentrenar. El cache se guarda en JSON
+    cruzada, el grid de hiperparametros (si aplica) y la version de
+    scikit-learn. La huella se hashea con SHA-256 para nombrar el archivo
+    de cache. Si ya existe un resultado con ese hash, se reutiliza en vez
+    de reentrenar. El cache se guarda en JSON
     (no pickle), ya que el resultado es una tabla simple (numeros,
     listas de nombres de columnas y un diccionario de hiperparametros) y
     JSON no depende de la version de pandas/numpy que lo genero.
@@ -331,6 +332,9 @@ def evaluar_forward(
         Metrica con la que `GridSearchCV` elige los mejores
         hiperparametros ("f1", "auc" o "recall"). Solo aplica si
         `param_grid` no es None. Por defecto "f1".
+    n_jobs : int, optional
+        Procesos paralelos de scikit-learn. Por defecto -1 (todos los
+        nucleos disponibles).
 
     Returns
     -------
@@ -1343,10 +1347,11 @@ def evaluar_grid_search(
 
     Igual que `evaluar_forward`, la busqueda es costosa pero siempre da el
     mismo resultado para los mismos datos/modelo/grid, asi que se memoriza
-    en disco: se arma una huella con las columnas de X, su forma, el
-    estimador base (con sus hiperparametros), param_grid, cv, scoring y
-    refit, y se hashea (md5) para nombrar el archivo de cache. Si ya existe
-    un resultado con ese hash, se reutiliza en vez de repetir la busqueda.
+    en disco: se arma una huella con el contenido, esquema y orden de X/y,
+    el estimador base (con sus hiperparametros), param_grid, cv, scoring,
+    refit, `n_jobs` y la version de scikit-learn. La huella se hashea con
+    SHA-256 para nombrar el archivo de cache. Si ya existe un resultado con
+    ese hash, se reutiliza en vez de repetir la busqueda.
 
     El cache solo guarda `cv_results_` y los mejores hiperparametros (JSON,
     no pickle, por la misma razon que en `evaluar_forward`); el estimador
@@ -1380,6 +1385,9 @@ def evaluar_grid_search(
     directorio_cache : str, optional
         Carpeta donde se guardan/leen los resultados persistidos. Por
         defecto "cache".
+    n_jobs : int, optional
+        Procesos paralelos de scikit-learn. Por defecto -1 (todos los
+        nucleos disponibles).
 
     Returns
     -------
@@ -3407,6 +3415,9 @@ def evaluar_familia_qsvm(
         Grid de `C`. Por defecto ``{"C": [1e-6, 0.1, 1, 10]}``.
     random_state : int, optional
         Semilla del SVC y del CV. Por defecto 42.
+    n_jobs : int, optional
+        Procesos paralelos usados por `GridSearchCV`. Por defecto -1
+        (todos los nucleos disponibles).
 
     Returns
     -------

@@ -1,137 +1,195 @@
-# QuantumTenango - Quantathon 2026 Track 2
+# QuantumTenango — QSVM para potabilidad del agua
 
-Versión limpia y unificada del proyecto: **un solo cuaderno** (`qsvm_water.ipynb`)
-que reproduce todos los resultados de punta a punta con un *run all*, y **un solo
-archivo de funciones** (`funciones.py`). Esta carpeta (`limpio/`) es el resultado
-del proceso de migración; al terminar, `main` quedará con este contenido y lo
-demás pasará a una carpeta `anterior/` sin seguimiento.
+Repositorio reproducible del Track 2 de Quantathon 2026. El flujo completo está unificado en un cuaderno (`qsvm_water.ipynb`) y las funciones de modelización están centralizadas en `funciones.py`.
+
+El cuaderno puede ejecutarse de principio a fin sin recalcular los kernels cuánticos: las matrices validadas están versionadas en `data/runs/` y un *run all* las carga de forma idempotente.
+
+## Resultado principal
+
+El baseline clásico sobre el conjunto completo usa cinco variables (`ph`, `Hardness`, `Solids`, `Chloramines`, `Sulfate`) y un SVM RBF con `C=10`, `gamma="auto"` y clases balanceadas por peso. En el conjunto de prueba estratificado alcanza:
+
+| Accuracy | Balanced accuracy | Precision | Recall | F1 | AUC |
+|---:|---:|---:|---:|---:|---:|
+| 0.6631 | 0.6323 | 0.5806 | 0.4922 | 0.5328 | 0.6928 |
+
+Para el benchmark de muestras pequeñas, las familias QSVM se ordenan y la mejor familia de cada tamaño se selecciona por F1 de test:
+
+| Train / test | Familia QSVM seleccionada | F1-CV train | F1 test QSVM | F1 test SVM-RBF | Delta |
+|---:|---|---:|---:|---:|---:|
+| 16 / 8 | `zz_16` | 0.5267 | 0.6000 | 0.6667 | -0.0667 |
+| 32 / 16 | `zyy_32` | 0.5252 | 0.6250 | 0.6316 | -0.0066 |
+
+Con estas muestras no se observa ventaja cuántica frente al SVM clásico. Los conjuntos de prueba tienen solo 8 y 16 observaciones balanceadas; por ello, estas cifras son un benchmark exploratorio y no una estimación estable del desempeño poblacional.
 
 ## Estructura
 
-- `qsvm_water.ipynb`: cuaderno único de flujo de trabajo (ver "Pasos del cuaderno").
-- `funciones.py`: todas las funciones del proyecto (análisis, SVM clásico,
-  kernel cuántico, resultados). Ninguna lógica reutilizable vive en celdas del
-  cuaderno.
-- `requirements.txt`: dependencias exactas del proyecto.
-- `data/raw/`: dataset original (`water_potability.csv`).
-- `data/processed/dataset_v1.xlsx`: datasets generados por el Paso 1 (hojas
-  `originales`, `imputados`, `normalizados`, `muestreos`, `variables`).
-- `data/runs/`: matrices kernel persistidas por familia
-  (`{Familia}_Train_{tamaño}.csv` / `{Familia}_Test_{tamaño}.csv`, separador `;`).
-- `data/img/`: figuras del cuaderno, con convención
-  `{paso:02d}_{sección:02d}_{descripción}.png` (ej. `01_02_metricas_forward.png`,
-  `03_04_resultado_zyy_32.png`).
-- `cache/`: resultados persistidos (JSON por hash) de `evaluar_forward` y
-  `evaluar_grid_search`; evita reentrenar lo que ya se ejecutó. En esta carpeta
-  sí se versiona (documenta la ejecución del análisis).
-
-## Pasos del cuaderno
-
-### Paso 1. Preparación de baseline (SVM clásico)
-Carga y análisis del dataset, partición estratificada, imputación por medianas
-de train, estandarización, selección de variables por forward selection
-(`evaluar_forward`, con caché), optimización de hiperparámetros
-(`evaluar_grid_search`, con caché), modelo final y guardado de
-`dataset_v1.xlsx` (datasets + muestreo jerárquico balanceado + variables
-seleccionadas). Toda fuente de aleatoriedad lleva semilla explícita
-(`random_state=42`) para replicabilidad completa.
-
-### Paso 2. Kernel cuántico
-- **2.1 Familias**: `FAMILIAS` define a mano las combinaciones
-  `(feature_map, tamaño)` — feature maps `zz`, `zyy`, `ry_cx_rx`; tamaños 16 y
-  32 — con dos rutas opcionales `(feature_map, tamaño, ruta_train, ruta_test)`
-  hacia matrices ya calculadas (idempotencia: lo ya calculado no se recalcula;
-  `""` marca la matriz que falte).
-- **2.2 Datos**: tabla resumen de registros train/test por familia (según el
-  nivel de muestreo: 16→nivel 3, 32→nivel 2) y dimensión cuántica (un qubit
-  por variable seleccionada).
-- **2.3 Inspección**: los 6 circuitos U(x)/U(x)† de los 3 feature maps,
-  apilados y navegables.
-- **2.4 Matrices**: `cargar_ktrain`/`cargar_ktest` cargan lo ya persistido
-  (tabla de estado, sin interacción, apto para *run all*). Las familias
-  pendientes se calculan con `calcular_ktrain` (2.4.1) o `calcular_ktest`
-  (2.4.2): backend local síncrono, o job de Nexus + `consultar_ktrain`/
-  `consultar_ktest`. Backend por defecto: `local_selene_statevector`; también
-  se admiten simuladores y hardware vía Nexus (`MATRIX_BACKEND_OPTIONS`).
-
-### Paso 3. Resultados por familia
-Con las matrices persistidas: SVM de kernel precomputado por familia (búsqueda
-de `C` por validación cruzada), comparación de métricas train vs test (brecha
-de overfitting), figura 1×3 por familia (heatmap de K_train + matrices de
-confusión de train y test, guardada en `data/img/`) y tabla resumen de las 6
-familias ordenada por F1 de test.
-
-## Entorno Conda
-
-Entorno de validación de la migración: `qsvm_migration` (Python 3.11). Para
-recrearlo en cualquier máquina:
-
-```bash
-# 1. Crear el entorno con Python 3.11
-conda create -n qsvm_migration python=3.11 -y
-
-# 2. Activar el entorno
-conda activate qsvm_migration
-
-# 3. Instalar las dependencias del proyecto
-pip install -r requirements.txt
-
-# 4. Registrar el entorno como kernel de Jupyter
-python -m ipykernel install --user --name qsvm_migration --display-name "qsvm_migration"
-
-# 5. Abrir el cuaderno (selecciona el kernel "qsvm_migration")
-jupyter lab
+```text
+.
+├── qsvm_water.ipynb          # flujo completo y resultados ejecutados
+├── funciones.py              # funciones clásicas, cuánticas y de evaluación
+├── requirements.txt          # versiones directas validadas
+├── cache/                    # resultados deterministas de búsquedas costosas
+└── data/
+    ├── raw/                  # dataset original
+    ├── processed/            # dataset_v1.xlsx
+    ├── runs/                 # matrices kernel y su documentación
+    └── img/                  # figuras generadas por el cuaderno
 ```
 
-Para eliminarlo si algo sale mal:
+`dataset_v1.xlsx` contiene cinco hojas:
+
+- `originales`: observaciones originales con indicador train/test;
+- `imputados`: medianas estimadas en train y aplicadas a train/test;
+- `normalizados`: escalado estimado en train y aplicado a train/test;
+- `muestreos`: subconjuntos balanceados, jerárquicos y reproducibles;
+- `variables`: variables elegidas por forward selection.
+
+## Datos
+
+El archivo original contiene 3,276 observaciones, nueve predictores numéricos y la variable binaria `Potability`. Se usa el dataset público [Water Potability Dataset with 10 Parameters](https://www.kaggle.com/datasets/devanshibavaria/water-potability-dataset-with-10-parameteres), publicado por Devanshi Bavaria bajo licencia CC0 (dominio público).
+
+La partición es 80/20, estratificada y con `random_state=42`. La separación se realiza antes de imputar o escalar. Las medianas y los parámetros de estandarización se ajustan únicamente con train.
+
+## Metodología del cuaderno
+
+### Paso 1 — baseline SVM
+
+1. Análisis descriptivo y control de valores faltantes.
+2. División train/test estratificada.
+3. Imputación por medianas y estandarización sin usar información de test.
+4. Forward selection con validación cruzada.
+5. Búsqueda de `C` y `gamma` para el SVM RBF.
+6. Evaluación final en test y generación de `dataset_v1.xlsx`.
+
+La proporción aproximada 61/39 se trata con `class_weight="balanced"`; no se descartan observaciones del baseline. Los subconjuntos cuánticos sí se balancean para controlar el tamaño del experimento.
+
+La evaluación final del método fordward define un modelo de 5 variables que son: 
+ph, Hardness, Solids, Chloramines y Sulfate.
+
+### Paso 2 — kernels cuánticos
+
+Se evalúan tres feature maps (`zz`, `zyy`, `ry_cx_rx`) con cinco qubits —uno por variable— y tamaños de train 16 y 32. Cada familia tiene una matriz `K_train` cuadrada y una matriz `K_test` rectangular.
+
+La configuración declarada es simulación local con el  "local_selene_statevector", 1,000 disparos, semilla 42 y diagonal unitaria sin ejecuciones redundantes. El detalle de trazabilidad está en [`data/runs/README.md`](data/runs/README.md).
+
+El cálculo no se dispara automáticamente. `FAMILIAS` contiene las rutas de las matrices disponibles; un *run all* solo las carga. Las celdas 2.4.1 y 2.4.2 documentan cómo calcular explícitamente una familia pendiente, de forma local o en Quantinuum Nexus.
+
+### Paso 3 — evaluación QSVM
+
+Cada matriz se usa con `SVC(kernel="precomputed")`. El parámetro `C` se elige mediante validación cruzada estratificada de cinco pliegues en train. La tabla de familias se ordena por F1 de test.
+
+### Paso 4 — comparación controlada
+
+Para cada tamaño se entrena un SVM RBF clásico con exactamente las mismas
+observaciones y variables que el QSVM. La mejor familia cuántica por tamaño se elige por F1 de test y se compara contra ese baseline en el mismo test.
+
+## Instalación reproducible
+
+Se validó con Python 3.11.15. Las versiones directas de las dependencias están fijadas en `requirements.txt`.
+
+Clone el repositorio y entre en su raíz:
 
 ```bash
-conda deactivate
-conda env remove -n qsvm_migration
+git clone https://github.com/felipechoy1/QuantumTenango_Quantaton2026_Track2.git
+cd QuantumTenango_Quantaton2026_Track2
 ```
 
-## Dependencias principales
+### Opción A — `venv` (Windows PowerShell)
 
-- numpy, pandas, scikit-learn, imbalanced-learn
-- guppylang, qnexus, pytket, selene-sim (kernel cuántico: circuitos pytket,
-  ejecución local Selene y jobs en Quantinuum Nexus)
-- qiskit, qiskit-aer, pennylane (disponibles en el entorno; el flujo limpio
-  usa la vía pytket/guppy)
-- matplotlib, seaborn (visualización)
-- tqdm (barras de progreso de texto; sin dependencias de frontend)
-- openpyxl (lectura/escritura de `dataset_v1.xlsx`)
-- jupyterlab, ipykernel
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m ipykernel install --user --name qsvm-water --display-name "QSVM Water"
+```
 
-Pins exactos: `tket-exts==0.12.4` y `hugr==0.16.0` (versiones posteriores
-rompen `guppy.load_pytket`; no actualizar sin validar ese flujo).
+### Opción B — `venv` (macOS/Linux)
 
-## Convenciones del proyecto
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m ipykernel install --user --name qsvm-water --display-name "QSVM Water"
+```
 
-- **Un solo cuaderno, un solo archivo de funciones**: toda función nueva va a
-  `funciones.py`, nunca queda suelta en una celda.
-- **Semillas explícitas**: cualquier componente con aleatoriedad declara su
-  `random_state`/semilla, aunque el default coincida.
-- **Figuras**: se guardan siempre en `data/img/` con la convención
-  `{paso:02d}_{sección:02d}_{descripción}.png`.
-- **Idempotencia de matrices kernel**: las rutas en `FAMILIAS` son la fuente de
-  verdad de lo ya calculado; un *run all* carga lo persistido y nunca dispara
-  cómputo cuántico por sí solo (el cálculo es siempre una llamada explícita).
-- **Sin dependencias de frontend**: nada de ipywidgets; tablas de estado como
-  DataFrames y barras de progreso de texto, para que el cuaderno funcione igual
-  en cualquier entorno (Jupyter, VS Code, etc.).
+### Opción C — Conda
 
-## Historial de la migración
+```bash
+conda create -n qsvm-water python=3.11 -y
+conda activate qsvm-water
+python -m pip install -r requirements.txt
+python -m ipykernel install --user --name qsvm-water --display-name "QSVM Water"
+```
 
-- 2026-07-24: copia de `Código_Hackaton_v1.ipynb` como `qsvm_water.ipynb` con
-  imports podados; `funciones.py` propio; guardado de figuras en `data/img`;
-  semillas explícitas; secciones numeradas bajo "Paso 1".
-- 2026-07-24: Paso 2 — familias de modelos con rutas de idempotencia, tabla de
-  datos por familia, inspección de feature maps, y migración del flujo de
-  matrices kernel (`iniciar_matriz_kernel`, `iniciar_matriz_kernel_test`,
-  `consultar_matriz_nexus`, `guardar_kernel_qsvm`, etc.) desde
-  `funciones_nexus.py`.
-- 2026-07-24: `evaluar_grid_search` con caché en disco (igual que
-  `evaluar_forward`); 2.4 reescrito sin ipywidgets (frágil en VS Code) a
-  funciones planas con tabla de estado; 2.4.1/2.4.2 opcionales para calcular
-  K_train/K_test pendientes; Paso 3 de resultados por familia (referencia:
-  `analisis_familias_kernel.ipynb`).
+No se requieren credenciales de Nexus para reproducir los resultados
+versionados. Solo son necesarias si se elige un backend remoto para recalcular
+matrices.
+
+## Validación y ejecución
+
+Primero compruebe que los artefactos descargados son coherentes:
+
+```bash
+python validar_repositorio.py
+```
+
+El comando valida, sin modificar archivos:
+
+- forma, columnas, imputación y normalización del dataset;
+- tamaños, balance y anidamiento de los muestreos;
+- forma, rango, finitud, simetría, diagonal y espectro de cada kernel;
+- coherencia estadística entre las matrices de tamaños 16 y 32.
+
+Después abra el cuaderno:
+
+```bash
+jupyter lab qsvm_water.ipynb
+```
+
+Seleccione el kernel `QSVM Water` y ejecute **Run All**. También puede verificar
+la ejecución sin interfaz:
+
+```bash
+python -m jupyter nbconvert \
+  --to notebook \
+  --execute qsvm_water.ipynb \
+  --output qsvm_water.ejecutado.ipynb \
+  --ExecutePreprocessor.timeout=600
+```
+
+En PowerShell, el mismo comando puede escribirse en una sola línea.
+
+## Reproducibilidad y límites
+
+- Todas las fuentes de aleatoriedad del flujo declaran semilla 42.
+- Las cachés incorporan contenido, orden y esquema de los datos, parámetros del
+  modelo, configuración de CV y versión de scikit-learn.
+- Test permanece aislado durante el preprocesamiento, la selección de variables
+  y el ajuste de hiperparámetros. En el análisis QSVM sí se usa después para
+  ordenar las familias, de acuerdo con el criterio original del proyecto.
+- El escalado se ajusta sobre todo el train antes de las validaciones cruzadas
+  internas. Por tanto, los valores de CV sirven para selección y comparación,
+  pero no deben interpretarse como una estimación completamente anidada e
+  insesgada. La evaluación final reportada se realiza en el test reservado.
+- En el baseline, la selección forward y el grid de hiperparámetros se realizan
+  sobre train; su desempeño generalizable se juzga con el test reservado.
+- Como las familias QSVM se ordenan por su F1 de test, ese conjunto ya no
+  funciona como una evaluación independiente para comparar feature maps. La
+  tabla debe interpretarse como comparación exploratoria entre las familias
+  evaluadas, no como selección confirmada fuera de muestra.
+- Los experimentos QSVM son pequeños y sensibles a cada observación y al ruido
+  de disparos. No sustentan afirmaciones de superioridad cuántica.
+
+## Convenciones para contribuir
+
+- Mantener la lógica reutilizable de modelización en `funciones.py`.
+- Conservar el criterio original de ranking QSVM por F1 de test.
+- Conservar semillas explícitas y la separación train/test.
+- Guardar figuras en `data/img/` con nombres
+  `{paso:02d}_{seccion:02d}_{descripcion}.png`.
+- Ejecutar `python validar_repositorio.py` y un *run all* antes de subir cambios.
+- Si se reemplaza una matriz kernel, actualizar su ruta en `FAMILIAS`, verificar
+  el orden de las muestras y documentar la nueva procedencia en
+  `data/runs/README.md`.
