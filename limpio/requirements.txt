@@ -1,0 +1,24 @@
+numpy>=1.26,<3
+pandas>=2.1,<4
+scikit-learn>=1.4,<2
+imbalanced-learn>=0.12,<1
+qiskit>=2.1,<3
+qiskit-aer>=0.17,<1
+matplotlib>=3.8,<4
+seaborn>=0.13,<1
+pylatexenc>=2.10,<3
+jupyterlab>=4,<5
+ipykernel>=6,<8
+pennylane>=0.45,<1
+tqdm>=4.69,<5
+openpyxl>=3.1,<4
+ipywidgets>=8,<9
+guppylang>=0.21,<1
+qnexus>=0.46,<1
+pytket>=2.18,<3
+selene-sim>=0.2.18,<0.3
+# Pins exactos: tket-exts 0.14 y hugr 0.18 rompen la compilacion de
+# circuitos pytket dentro de guppy (guppy.load_pytket). No actualizar
+# sin validar ese flujo.
+tket-exts==0.12.4
+hugr==0.16.0
