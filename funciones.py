@@ -3420,3 +3420,151 @@ def graficar_resultado_familia(K_train, y_train, y_pred_train, y_test, y_pred_te
     fig.suptitle(nombre, fontsize=14, fontweight="bold")
     fig.tight_layout()
     return fig, axes
+
+
+# ---------------------------------------------------------------------------
+# Paso 4: SVM clasico comparativo, con el mismo tamano de muestra que cada
+# familia QSVM (replica la cantidad de registros, no el feature map).
+# ---------------------------------------------------------------------------
+
+def entrenar_svm_muestra(
+    muestreo_df,
+    variables,
+    tamano,
+    nivel_por_tamano,
+    objetivo="Potability",
+    param_grid=None,
+    random_state=42,
+    directorio_cache="cache",
+):
+    """Entrena un SVM clasico (RBF) sobre la muestra de un tamano dado.
+
+    Replica la cantidad de registros de train/test que usa una familia
+    QSVM de ese `tamano` (mismas filas de `muestreo_df`, mismas
+    `variables`), para poder comparar el QSVM contra un baseline clasico
+    entrenado con identica cantidad de datos. Un SVM clasico no depende
+    del feature map, asi que basta un entrenamiento por tamano (no uno por
+    familia): las familias que comparten tamano comparan contra el mismo
+    resultado.
+
+    La busqueda de hiperparametros usa `evaluar_grid_search` (mismo cache
+    en disco que el resto del cuaderno), asi que entrenar el mismo tamano
+    mas de una vez no recalcula nada. Las metricas se calculan con
+    `classification_metrics`, igual que `evaluar_familia_qsvm`, para que
+    ambos modelos sean directamente comparables.
+
+    Parameters
+    ----------
+    muestreo_df : pandas.DataFrame
+        Hoja `muestreos`, con las features escaladas, `objetivo`,
+        `_PartInd_` y `_Muestreo_`.
+    variables : list of str
+        Columnas predictoras (las mismas variables seleccionadas en el
+        Paso 1).
+    tamano : int
+        Tamano de train de la muestra (16 o 32).
+    nivel_por_tamano : dict
+        Mapeo tamano -> nivel de muestreo.
+    objetivo : str, optional
+        Columna objetivo. Por defecto "Potability".
+    param_grid : dict or None, optional
+        Grid de hiperparametros del SVM RBF. Por defecto
+        ``{"C": [0.1, 1, 10], "gamma": ["scale", "auto", 0.01]}``.
+    random_state : int, optional
+        Semilla del SVC y del CV. Por defecto 42.
+    directorio_cache : str, optional
+        Carpeta de cache de `evaluar_grid_search`. Por defecto "cache".
+
+    Returns
+    -------
+    dict
+        Con claves: "mejores_parametros", "metrics_train", "metrics_test",
+        "y_train", "y_test", "y_pred_train", "y_pred_test".
+    """
+    if param_grid is None:
+        param_grid = {"C": [0.1, 1, 10], "gamma": ["scale", "auto", 0.01]}
+
+    nivel = nivel_muestreo(tamano, nivel_por_tamano)
+    train_mask = (muestreo_df["_PartInd_"] == 0) & (muestreo_df["_Muestreo_"] >= nivel)
+    test_mask = (muestreo_df["_PartInd_"] == 1) & (muestreo_df["_Muestreo_"] >= nivel)
+
+    X_train = muestreo_df.loc[train_mask, variables].reset_index(drop=True)
+    y_train = muestreo_df.loc[train_mask, objetivo].reset_index(drop=True).astype(int)
+    X_test = muestreo_df.loc[test_mask, variables].reset_index(drop=True)
+    y_test = muestreo_df.loc[test_mask, objetivo].reset_index(drop=True).astype(int)
+
+    modelo = SVC(kernel="rbf", class_weight="balanced", probability=True,
+                 random_state=random_state)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+    scoring = {"accuracy": "accuracy", "precision": "precision", "recall": "recall",
+               "balanced_accuracy": "balanced_accuracy", "f1": "f1"}
+
+    _cv_results, modelo_final, mejores_parametros = evaluar_grid_search(
+        X_train, y_train, modelo, param_grid, cv, scoring, "f1",
+        directorio_cache=directorio_cache,
+    )
+
+    y_pred_train = modelo_final.predict(X_train)
+    y_score_train = modelo_final.decision_function(X_train)
+    metrics_train = classification_metrics(y_train, y_pred_train, y_score_train)
+
+    y_pred_test = modelo_final.predict(X_test)
+    y_score_test = modelo_final.decision_function(X_test)
+    metrics_test = classification_metrics(y_test, y_pred_test, y_score_test)
+
+    return {
+        "mejores_parametros": mejores_parametros,
+        "metrics_train": metrics_train,
+        "metrics_test": metrics_test,
+        "y_train": y_train,
+        "y_test": y_test,
+        "y_pred_train": y_pred_train,
+        "y_pred_test": y_pred_test,
+    }
+
+
+def graficar_comparacion_familia(
+    y_train,
+    y_pred_train_qsvm,
+    y_test,
+    y_pred_test_qsvm,
+    y_pred_train_svm,
+    y_pred_test_svm,
+    nombre_familia,
+    nombre_svm,
+):
+    """Arma la figura 1x4 de confusiones: QSVM train/test vs SVM train/test.
+
+    `y_train`/`y_test` son compartidas por ambos modelos (mismas filas,
+    misma muestra); solo las predicciones difieren.
+
+    Parameters
+    ----------
+    y_train, y_test : array-like
+        Etiquetas reales de train y test (comunes a ambos modelos).
+    y_pred_train_qsvm, y_pred_test_qsvm : array-like
+        Predicciones del QSVM de la familia.
+    y_pred_train_svm, y_pred_test_svm : array-like
+        Predicciones del SVM clasico del mismo tamano de muestra.
+    nombre_familia : str
+        Nombre de la familia QSVM (para los titulos).
+    nombre_svm : str
+        Nombre del baseline clasico (por ejemplo "SVM_16").
+
+    Returns
+    -------
+    tuple
+        (fig, axes) de matplotlib.
+    """
+    fig, axes = plt.subplots(1, 4, figsize=(24, 5.5))
+    graficar_matriz_confusion_ax(y_train, y_pred_train_qsvm, ax=axes[0],
+                                 titulo=f"{nombre_familia} - Train")
+    graficar_matriz_confusion_ax(y_test, y_pred_test_qsvm, ax=axes[1],
+                                 titulo=f"{nombre_familia} - Test")
+    graficar_matriz_confusion_ax(y_train, y_pred_train_svm, ax=axes[2],
+                                 titulo=f"{nombre_svm} - Train")
+    graficar_matriz_confusion_ax(y_test, y_pred_test_svm, ax=axes[3],
+                                 titulo=f"{nombre_svm} - Test")
+    fig.suptitle(f"{nombre_familia} vs {nombre_svm}", fontsize=14, fontweight="bold")
+    fig.tight_layout()
+    return fig, axes
