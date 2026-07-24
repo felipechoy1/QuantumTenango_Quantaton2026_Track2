@@ -123,73 +123,22 @@ python -m pip install -r requirements.txt
 python -m ipykernel install --user --name qsvm-water --display-name "QSVM Water"
 ```
 
-No se requieren credenciales de Nexus para reproducir los resultados
-versionados. Solo son necesarias si se elige un backend remoto para recalcular
-matrices.
+No se requieren credenciales de Nexus para reproducir los resultados versionados. Solo son necesarias si se elige un backend remoto para recalcular matrices.
 
-## Validación y ejecución
-
-Primero compruebe que los artefactos descargados son coherentes:
-
-```bash
-python validar_repositorio.py
-```
-
-El comando valida, sin modificar archivos:
-
-- forma, columnas, imputación y normalización del dataset;
-- tamaños, balance y anidamiento de los muestreos;
-- forma, rango, finitud, simetría, diagonal y espectro de cada kernel;
-- coherencia estadística entre las matrices de tamaños 16 y 32.
-
-Después abra el cuaderno:
+## Ejecución
 
 ```bash
 jupyter lab qsvm_water.ipynb
 ```
 
-Seleccione el kernel `QSVM Water` y ejecute **Run All**. También puede verificar
-la ejecución sin interfaz:
-
-```bash
-python -m jupyter nbconvert \
-  --to notebook \
-  --execute qsvm_water.ipynb \
-  --output qsvm_water.ejecutado.ipynb \
-  --ExecutePreprocessor.timeout=600
-```
-
-En PowerShell, el mismo comando puede escribirse en una sola línea.
+Seleccione el kernel `QSVM Water` y ejecute **Run All**.
 
 ## Reproducibilidad y límites
 
 - Todas las fuentes de aleatoriedad del flujo declaran semilla 42.
 - Las cachés incorporan contenido, orden y esquema de los datos, parámetros del
   modelo, configuración de CV y versión de scikit-learn.
-- Test permanece aislado durante el preprocesamiento, la selección de variables
-  y el ajuste de hiperparámetros. En el análisis QSVM sí se usa después para
-  ordenar las familias, de acuerdo con el criterio original del proyecto.
-- El escalado se ajusta sobre todo el train antes de las validaciones cruzadas
-  internas. Por tanto, los valores de CV sirven para selección y comparación,
-  pero no deben interpretarse como una estimación completamente anidada e
-  insesgada. La evaluación final reportada se realiza en el test reservado.
-- En el baseline, la selección forward y el grid de hiperparámetros se realizan
-  sobre train; su desempeño generalizable se juzga con el test reservado.
-- Como las familias QSVM se ordenan por su F1 de test, ese conjunto ya no
-  funciona como una evaluación independiente para comparar feature maps. La
-  tabla debe interpretarse como comparación exploratoria entre las familias
-  evaluadas, no como selección confirmada fuera de muestra.
-- Los experimentos QSVM son pequeños y sensibles a cada observación y al ruido
-  de disparos. No sustentan afirmaciones de superioridad cuántica.
-
-## Convenciones para contribuir
-
-- Mantener la lógica reutilizable de modelización en `funciones.py`.
-- Conservar el criterio original de ranking QSVM por F1 de test.
-- Conservar semillas explícitas y la separación train/test.
-- Guardar figuras en `data/img/` con nombres
-  `{paso:02d}_{seccion:02d}_{descripcion}.png`.
-- Ejecutar `python validar_repositorio.py` y un *run all* antes de subir cambios.
-- Si se reemplaza una matriz kernel, actualizar su ruta en `FAMILIAS`, verificar
-  el orden de las muestras y documentar la nueva procedencia en
-  `data/runs/README.md`.
+- Test permanece aislado durante el preprocesamiento, la selección de variables y el ajuste de hiperparámetros. En el análisis QSVM sí se usa después para   ordenar las familias, de acuerdo con el criterio original del proyecto.
+- El escalado se ajusta sobre todo el train antes de las validaciones cruzadas internas. Por tanto, los valores de CV sirven para selección y comparación. La evaluación final reportada se realiza en el test reservado.
+- En el baseline, la selección forward y el grid de hiperparámetros se realizan sobre train; su desempeño generalizable se juzga con el test reservado.
+- Los experimentos QSVM son pequeños y sensibles a cada observación y al ruido de disparos. No sustentan afirmaciones de superioridad cuántica, son útiles para explorar la implementación del algoritmo.
